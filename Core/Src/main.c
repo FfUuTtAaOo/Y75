@@ -364,13 +364,26 @@ int main(void)
   MX_I2C2_Init();
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
-    // at24c04_read(UART_BAUD_ADDR, at24c04_read_buffer, 4);
-    // for (int i = 0; i < 4; i++) {
-    //     uart1_bsp = U8_TO_U32_SAFE(at24c04_read_buffer[i], uart1_bsp, i);
-    // }
-    // if (uart1_bsp == 0xFFFFFFFF || uart1_bsp == 0x00000000) {
-    //     uart1_bsp = UART_BAUD_0x01;
-    // }
+    /* Restore the persisted baud rate (written by RS485_CMD_SET_BAUD).
+       Fall back to 460800 when the EEPROM is blank or holds an unsupported
+       value, so a corrupt entry can never brick the communication link. */
+    {
+        uint8_t  baud_buf[4] = { 0 };
+        uint32_t baud = 0;
+
+        at24c04_read(UART_BAUD_ADDR, baud_buf, 4);
+        baud = ((uint32_t)baud_buf[0])
+             | ((uint32_t)baud_buf[1] << 8)
+             | ((uint32_t)baud_buf[2] << 16)
+             | ((uint32_t)baud_buf[3] << 24);
+
+        if (baud == 460800U || baud == 256000U || baud == 115200U ||
+            baud == 19200U  || baud == 9600U) {
+            uart1_bsp = baud;
+        } else {
+            uart1_bsp = UART_BAUD_0x01;
+        }
+    }
     CUSTOM_USART1_Init();
 
     calib_init();

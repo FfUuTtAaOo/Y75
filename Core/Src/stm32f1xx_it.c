@@ -23,7 +23,6 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "lha7668.h"
-#include "function.h"
 
 /* USER CODE END Includes */
 

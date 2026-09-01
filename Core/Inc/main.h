@@ -86,6 +86,9 @@ void uart_debug(const char *msg);
 #define UART_BAUD_0x03        115200
 #define UART_BAUD_0x04        19200
 #define UART_BAUD_0x05        9600
+
+/* EEPROM address holding the 4-byte (little-endian) UART baud rate */
+#define UART_BAUD_ADDR        0x78
 #define GM_ADC_MODEL_INFO      0x05
 #define GM_INIT_SEND_RET       0x06
 

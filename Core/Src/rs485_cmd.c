@@ -6,6 +6,8 @@
 #include "filter.h"
 #include <string.h>
 #include "tim.h"
+#include "usart.h"
+#include "at24c04.h"
 
 extern uint8_t output_interface;
 extern uint8_t ether_flag;
@@ -40,6 +42,61 @@ static void respond(uint8_t cmd, const uint8_t *data, uint16_t len)
 
 /* Send a single-byte ACK response */
 static void ack(uint8_t cmd) { respond(cmd, NULL, 0); }
+
+/* Map a baud-rate code (1..5) to the actual baud rate.
+ * Returns 0 when the code is not one of the supported values. */
+static uint32_t baud_from_code(uint8_t code)
+{
+    switch (code) {
+    case RS485_BAUD_460800: return 460800U;
+    case RS485_BAUD_256000: return 256000U;
+    case RS485_BAUD_115200: return 115200U;
+    case RS485_BAUD_19200:  return 19200U;
+    case RS485_BAUD_9600:   return 9600U;
+    default:                return 0U;
+    }
+}
+
+/* Apply a new baud rate: save it to EEPROM, then re-init USART1 and restart
+ * DMA reception.  Must be called AFTER the ACK has been transmitted so the
+ * host can still read the response at the old baud rate. */
+static void apply_baud(uint32_t baud)
+{
+    uint8_t  ee[4];
+    uint16_t i;
+
+    uart1_bsp = baud;
+
+    /* Persist (little-endian), same layout as the legacy GM_MOD_BAUD command */
+    for (i = 0; i < 4; i++) {
+        ee[i] = (uint8_t)(baud >> (i * 8));
+    }
+    at24c04_write(UART_BAUD_ADDR, ee, 4);
+
+    /* Wait until the last ACK byte has completely shifted out */
+    while (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_TC) == RESET) {}
+    __HAL_UART_CLEAR_FLAG(&huart1, UART_FLAG_TC);
+
+    /* Stop DMA reception, then re-configure the UART at the new baud rate */
+    if (huart1.hdmarx) {
+        HAL_UART_DMAStop(&huart1);
+    }
+    HAL_UART_DeInit(&huart1);
+
+    huart1.Instance          = USART1;
+    huart1.Init.BaudRate     = baud;
+    huart1.Init.WordLength   = UART_WORDLENGTH_8B;
+    huart1.Init.StopBits     = UART_STOPBITS_1;
+    huart1.Init.Parity       = UART_PARITY_NONE;
+    huart1.Init.Mode         = UART_MODE_TX_RX;
+    huart1.Init.HwFlowCtl    = UART_HWCONTROL_NONE;
+    huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+    HAL_UART_Init(&huart1);
+
+    /* Re-enable IDLE-line detection and restart DMA reception */
+    __HAL_UART_ENABLE_IT(&huart1, UART_IT_IDLE);
+    rs485_rx_restart();
+}
 
 /* ================================================================
  *  rs485_cmd_dispatch
@@ -81,7 +138,19 @@ void rs485_cmd_dispatch(uint8_t cmd, const uint8_t *payload, uint16_t len)
         break;
     }
 
-    /* ---- 0x04  Set frequency ---- */
+    /* ---- 0x04  Set baud rate: AA 55 04 [code] 0D 0A ---- */
+    case RS485_CMD_SET_BAUD: {
+        uint32_t baud;
+        if (len < 1) { g_sys.comm_error_cnt++; break; }
+        baud = baud_from_code(payload[0]);
+        if (baud == 0U) { g_sys.comm_error_cnt++; break; }   /* invalid code */
+
+        ack(cmd);               /* ACK first, at the OLD baud rate          */
+        apply_baud(baud);       /* persist + re-init USART1 at the new rate */
+        break;
+    }
+
+    /* ---- 0x08  Set frequency: AA 55 08 [0|1] 0D 0A ---- */
     case RS485_CMD_SET_FREQ:
         if (len < 1) { g_sys.comm_error_cnt++; break; }
         g_sys.freq_mode = (payload[0] == 0) ? 0U : 1U;

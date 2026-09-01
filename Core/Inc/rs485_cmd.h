@@ -17,10 +17,11 @@ extern "C" {
 #define RS485_CMD_STOP          0x01  /* Stop continuous data output         */
 #define RS485_CMD_START         0x02  /* Start continuous 500Hz output       */
 #define RS485_CMD_SINGLE        0x03  /* Single-shot data request            */
-#define RS485_CMD_SET_FREQ      0x04  /* Set frequency: 0=500Hz, 1=1000Hz    */
+#define RS485_CMD_SET_BAUD      0x04  /* Set baud rate: AA 55 04 [code] 0D 0A*/
 #define RS485_CMD_QUERY_SN      0x05  /* Query serial number                 */
 #define RS485_CMD_QUERY_VER     0x06  /* Query firmware version              */
 #define RS485_CMD_QUERY_STATUS  0x07  /* Query system status                 */
+#define RS485_CMD_SET_FREQ      0x08  /* Set frequency: 0=500Hz, 1=1000Hz    */
 #define RS485_CMD_ZERO          0x30  /* Zero calibration (set offsets)      */
 #define RS485_CMD_UNZERO        0x36  /* Cancel zero (clear offsets)         */
 #define RS485_CMD_HEX_SEND      0x31
@@ -38,6 +39,15 @@ extern "C" {
 #define RS485_CMD_QUERY_NET     0x0F  /* Query network config                */
 #define RS485_CMD_SET_MATRIX    0x20  /* Upload decoupling matrix (144 bytes) */
 #define RS485_CMD_DEBUG_MODE    0x35  /* Toggle debug mode                   */
+
+/** @name Baud-rate codes — payload byte of RS485_CMD_SET_BAUD (AA 55 04 [code] 0D 0A) */
+/*@{*/
+#define RS485_BAUD_460800       0x01  /* 460800 bps                          */
+#define RS485_BAUD_256000       0x02  /* 256000 bps                          */
+#define RS485_BAUD_115200       0x03  /* 115200 bps                          */
+#define RS485_BAUD_19200        0x04  /* 19200  bps                          */
+#define RS485_BAUD_9600         0x05  /* 9600   bps                          */
+/*@}*/
 
 /** @name Continuous data frame CMD byte */
 #define RS485_CMD_CONT_DATA     0x02  /* Continuous/single data frame        */
