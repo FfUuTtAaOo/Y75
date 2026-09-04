@@ -9,7 +9,6 @@
 #include "usart.h"
 #include "at24c04.h"
 
-extern uint8_t output_interface;
 extern uint8_t ether_flag;
 
 /* ================================================================
@@ -99,6 +98,45 @@ static void apply_baud(uint32_t baud)
 }
 
 /* ================================================================
+ *  rs485_send_data_frame
+ * ================================================================ */
+void rs485_send_data_frame(uint8_t cmd)
+{
+    uint8_t d[28];
+    uint8_t i;
+
+    /* debug_mode: 0 = framed output, 1 = raw floats + 00 00 80 7F,
+       anything else = silent, nothing is sent at all. */
+    if (g_sys.debug_mode != 0U && g_sys.debug_mode != 1U) {
+        return;
+    }
+
+    for (i = 0; i < 6; i++) {
+        float f = g_sensor.force[i];        /* read volatile once */
+        float_to_le(d + i * 4, f);
+    }
+
+    if (g_sys.debug_mode == 1) {
+        /* Debug mode (only 1): [6 × float32 LE] 00 00 80 7F */
+        d[24] = 0x00;
+        d[25] = 0x00;
+        d[26] = 0x80;
+        d[27] = 0x7F;
+        just_float_send_raw(d, 28);
+    } else {
+        /* debug_mode == 0 — standard HEX frame:
+           AA 55 [cmd] [6 × float32 LE] 0D 0A
+           0x02 for the continuous stream, 0x03 for a single-shot reply.
+           Shift the payload right by one to make room for the CMD byte. */
+        for (i = 24; i >= 1; i--) {
+            d[i] = d[i - 1];
+        }
+        d[0] = cmd;
+        rs485_send_raw(d, 1 + 24);
+    }
+}
+
+/* ================================================================
  *  rs485_cmd_dispatch
  * ================================================================ */
 void rs485_cmd_dispatch(uint8_t cmd, const uint8_t *payload, uint16_t len)
@@ -110,7 +148,6 @@ void rs485_cmd_dispatch(uint8_t cmd, const uint8_t *payload, uint16_t len)
     /* ---- 0x01  Stop continuous send ---- */
     case RS485_CMD_STOP:
         g_sys.send_mode = 0;
-        output_interface = 0;
         ack(cmd);
         break;
 
@@ -118,25 +155,15 @@ void rs485_cmd_dispatch(uint8_t cmd, const uint8_t *payload, uint16_t len)
     case RS485_CMD_START:
         HAL_TIM_Base_Start_IT(&htim2);
         g_sys.send_mode = 1;
-        output_interface = 1;
         ack(cmd);
         break;
 
     /* ---- 0x03  Single-shot request ---- */
-    case RS485_CMD_SINGLE: {
-        /* Respond with one data frame: AA 55 00 [SEQ4B] [6×float32] 0D 0A */
-        uint32_t seq = g_sys.frame_seq++;
-        buf[0] = RS485_CMD_CONT_DATA;                  /* CMD */
-        buf[1] = (uint8_t)(seq);
-        buf[2] = (uint8_t)(seq >> 8);
-        buf[3] = (uint8_t)(seq >> 16);
-        buf[4] = (uint8_t)(seq >> 24);
-        for (int i = 0; i < 6; i++) {
-            float_to_le(buf + 5 + i * 4, g_sensor.force[i]);
-        }
-        rs485_send_raw(buf, 5 + 24);
+    case RS485_CMD_SINGLE:
+        /* AA 55 03 [6×float32] 0D 0A — same payload as the 0x02 stream,
+           only the command byte differs so the host can tell them apart. */
+        rs485_send_data_frame(RS485_CMD_SINGLE);
         break;
-    }
 
     /* ---- 0x04  Set baud rate: AA 55 04 [code] 0D 0A ---- */
     case RS485_CMD_SET_BAUD: {

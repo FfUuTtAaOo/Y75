@@ -73,11 +73,10 @@ volatile sensor_data_t   g_sensor;
 volatile system_state_t  g_sys;
 config_t                 g_config = {
     .sn         = "HS-01234567",
-    .fw_version = 0x0101,
+    .fw_version = 0x0102,
 };
 decouple_matrix_t        g_matrix;
 
-uint8_t output_interface = 0;
 uint8_t ether_flag = 1;
 
 /* USER CODE END PV */
@@ -272,15 +271,16 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 /* ---- Continuous RS485 data send state ---- */
 static uint32_t g_last_rs485_send_ms;
 
+/* ---- PA12 streaming heartbeat ---- */
+#define LED_BLINK_HALF_PERIOD_MS   500U    /* 500 ms on / 500 ms off = 1 Hz */
+static uint32_t g_led_toggle_ms;
+
 void send_string(uint8_t *str, uint16_t len)
 {
     HAL_UART_Transmit(&huart1, (uint8_t *)str, len, 500);
 }
 
-uint8_t hex_buf_send[256] = { 0 };
 uint8_t mb_buf_send[33] = { 0 };
-
-#define HEX_BUF_SEND_OFFSET 1
 
 static void rs485_send_continuous(void)
 {
@@ -288,41 +288,10 @@ static void rs485_send_continuous(void)
     if ((g_tick_ms - g_last_rs485_send_ms) >= interval) {
         g_last_rs485_send_ms = g_tick_ms;
 
-        if (g_sys.debug_mode == 0) {
-            if (output_interface == 1) {
-                /* Build data frame: AA 55 00 [SEQ4B] [6×float32] 0D 0A */
-                // uint32_t seq = g_sys.frame_seq++;
-                hex_buf_send[0] = RS485_CMD_CONT_DATA;
-                // hex_buf_send[1] = (uint8_t)(seq);
-                // hex_buf_send[2] = (uint8_t)(seq >> 8);
-                // hex_buf_send[3] = (uint8_t)(seq >> 16);
-                // hex_buf_send[4] = (uint8_t)(seq >> 24);
-                for (int i = 0; i < 6; i++) {
-                    float f = g_sensor.force[i];   /* read volatile once */
-                    uint32_t u; memcpy(&u, &f, 4);
-                    hex_buf_send[HEX_BUF_SEND_OFFSET + i * 4 + 0] = (uint8_t)(u);
-                    hex_buf_send[HEX_BUF_SEND_OFFSET + i * 4 + 1] = (uint8_t)(u >> 8);
-                    hex_buf_send[HEX_BUF_SEND_OFFSET + i * 4 + 2] = (uint8_t)(u >> 16);
-                    hex_buf_send[HEX_BUF_SEND_OFFSET + i * 4 + 3] = (uint8_t)(u >> 24);
-                }
-
-                rs485_send_raw(hex_buf_send, 24 + HEX_BUF_SEND_OFFSET);
-            }
-        } else if (g_sys.debug_mode == 1) {
-            for (int i = 0; i < 6; i++) {
-                float f = g_sensor.force[i];   /* read volatile once */
-                uint32_t u; memcpy(&u, &f, 4);
-                hex_buf_send[i * 4 + 0] = (uint8_t)(u);
-                hex_buf_send[i * 4 + 1] = (uint8_t)(u >> 8);
-                hex_buf_send[i * 4 + 2] = (uint8_t)(u >> 16);
-                hex_buf_send[i * 4 + 3] = (uint8_t)(u >> 24);
-            }
-            hex_buf_send[24] = 0x00;
-            hex_buf_send[25] = 0x00;
-            hex_buf_send[26] = 0x80;
-            hex_buf_send[27] = 0x7F;
-            just_float_send_raw(hex_buf_send, 28);
-        }
+        /* Only reached while g_sys.send_mode == 1 (checked by the caller).
+           The frame layout — AA 55 02 [6×float32] 0D 0A, the 00 00 80 7F
+           debug frame, or nothing at all — is chosen by debug_mode. */
+        rs485_send_data_frame(RS485_CMD_START);
     }
 }
 
@@ -441,6 +410,24 @@ int main(void)
             rs485_send_continuous();
         } else {
             g_last_rs485_send_ms = g_tick_ms;   /* reset timer on stop */
+        }
+
+        /* PA12 heartbeat: toggles every 500 ms (1 Hz blink) while frames are
+           actually going out — i.e. after AA 55 02 0D 0A and while the output
+           format is one that transmits. Held low as soon as output stops. */
+        {
+            uint8_t streaming = (g_sys.send_mode == 1) &&
+                                (g_sys.debug_mode == 0 || g_sys.debug_mode == 1);
+
+            if (streaming) {
+                if ((uint32_t)(g_tick_ms - g_led_toggle_ms) >= LED_BLINK_HALF_PERIOD_MS) {
+                    g_led_toggle_ms = g_tick_ms;
+                    HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_12);
+                }
+            } else {
+                HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET);
+                g_led_toggle_ms = g_tick_ms;    /* keep the phase aligned */
+            }
         }
 
         rs485_process();

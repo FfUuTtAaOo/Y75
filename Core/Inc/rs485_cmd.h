@@ -57,6 +57,19 @@ extern "C" {
 #define RS485_RESP_FLAG         0x80  /* AA 55 [CMD|0x80] [DATA] 0D 0A       */
 
 /**
+ * Send one data frame carrying the current 6-axis values.
+ *
+ * debug_mode == 0:  AA 55 [cmd] [6 × float32 LE] 0D 0A
+ * debug_mode == 1:  [6 × float32 LE] 00 00 80 7F          (cmd unused)
+ * any other value:  silent — no frame is transmitted at all
+ *
+ * @param cmd  command byte placed after the AA 55 header.
+ *             Pass RS485_CMD_START  (0x02) for continuous-stream frames,
+ *             or   RS485_CMD_SINGLE (0x03) for a single-shot reply.
+ */
+void rs485_send_data_frame(uint8_t cmd);
+
+/**
  * Dispatch an incoming RS485 command.
  * Called by the rs485_process() frame callback.
  *
