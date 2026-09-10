@@ -46,15 +46,6 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define INIT_SEND_RET       0x01
-#define INIT_NOT_SEND_RET   0x00
-#define SEND_RET_FLAG_ADDR  0x7C
-
-#define ADC_SAMPLING_RATE_0   0
-#define ADC_SAMPLING_RATE_2   2
-
-#define APPINFO_VERSION (uint8_t*)"v0.1.2"
-#define APPINFO_BUILD_DATE (uint8_t*)"2026-04-29"
 
 /* USER CODE END PD */
 
@@ -73,11 +64,9 @@ volatile sensor_data_t   g_sensor;
 volatile system_state_t  g_sys;
 config_t                 g_config = {
     .sn         = "HS-01234567",
-    .fw_version = 0x0102,
+    .fw_version = 0x00010701,
 };
 decouple_matrix_t        g_matrix;
-
-uint8_t ether_flag = 1;
 
 /* USER CODE END PV */
 
@@ -103,69 +92,8 @@ static float adc_data_calculate(uint8_t index)
     return (float)((int32_t)adc_data_buff[adc_data_usr_count][index] - 0x800000) * (1.0f / 8388608.0f) * 2500;
 }
 
-float matrix[6][6] = { {0.298418, -0.211604, -0.529767, -0.012232, -0.178473, 0.211071 },
-                        {0.004134, 0.211038, -0.006878, 0.007002, -0.001183, -0.001670 },
-                        {0.006217, -0.000427, 0.558141, 0.003760, -0.004378, -0.142885 },
-                        {-0.000174, -0.000562, 0.001114, 0.001136, 0.000010, -0.000292 },
-                        {-0.000243, -0.000483, -0.003015, -0.000066, -0.001470, 0.001025 },
-                        {0.000317, -0.000204, -0.000423, -0.000031, -0.000158, 0.001769 }};
-
 static void adc_data_proc(float data[6])
 {
-    // int i = 0;
-    // if (g_sys.data_format == 0) {
-    //     for (i = 0; i < ADC_CHANNEL_NUM; i++) {
-    //         g_sensor.force[i] = data[i];
-    //     }
-    // } else if (g_sys.data_format == 1) {
-    //     g_sensor.force[0] = matrix[0][0] * data[0] / KILOGRAM_TO_NEWTON + matrix[0][1] * data[1] / KILOGRAM_TO_NEWTON +
-    //                 matrix[0][2] * data[2] / KILOGRAM_TO_NEWTON + matrix[0][3] * data[3] / KILOGRAM_TO_NEWTON +
-    //                 matrix[0][4] * data[4] / KILOGRAM_TO_NEWTON + matrix[0][5] * data[5] / KILOGRAM_TO_NEWTON;
-
-    //     g_sensor.force[1] = matrix[1][0] * data[0] / KILOGRAM_TO_NEWTON + matrix[1][1] * data[1] / KILOGRAM_TO_NEWTON +
-    //                 matrix[1][2] * data[2] / KILOGRAM_TO_NEWTON + matrix[1][3] * data[3] / KILOGRAM_TO_NEWTON +
-    //                 matrix[1][4] * data[4] / KILOGRAM_TO_NEWTON + matrix[1][5] * data[5] / KILOGRAM_TO_NEWTON;
-
-    //     g_sensor.force[2] = matrix[2][0] * data[0] / KILOGRAM_TO_NEWTON + matrix[2][1] * data[1] / KILOGRAM_TO_NEWTON +
-    //                 matrix[2][2] * data[2] / KILOGRAM_TO_NEWTON + matrix[2][3] * data[3] / KILOGRAM_TO_NEWTON +
-    //                 matrix[2][4] * data[4] / KILOGRAM_TO_NEWTON + matrix[2][5] * data[5] / KILOGRAM_TO_NEWTON;
-
-    //     g_sensor.force[3] = matrix[3][0] * data[0] / KILOGRAM_TO_NEWTON + matrix[3][1] * data[1] / KILOGRAM_TO_NEWTON +
-    //                 matrix[3][2] * data[2] / KILOGRAM_TO_NEWTON + matrix[3][3] * data[3] / KILOGRAM_TO_NEWTON +
-    //                 matrix[3][4] * data[4] / KILOGRAM_TO_NEWTON + matrix[3][5] * data[5] / KILOGRAM_TO_NEWTON;
-
-    //     g_sensor.force[4] = matrix[4][0] * data[0] / KILOGRAM_TO_NEWTON + matrix[4][1] * data[1] / KILOGRAM_TO_NEWTON +
-    //                 matrix[4][2] * data[2] / KILOGRAM_TO_NEWTON + matrix[4][3] * data[3] / KILOGRAM_TO_NEWTON +
-    //                 matrix[4][4] * data[4] / KILOGRAM_TO_NEWTON + matrix[4][5] * data[5] / KILOGRAM_TO_NEWTON;
-
-    //     g_sensor.force[5] = matrix[5][0] * data[0] / KILOGRAM_TO_NEWTON + matrix[5][1] * data[1] / KILOGRAM_TO_NEWTON +
-    //                 matrix[5][2] * data[2] / KILOGRAM_TO_NEWTON + matrix[5][3] * data[3] / KILOGRAM_TO_NEWTON +
-    //                 matrix[5][4] * data[4] / KILOGRAM_TO_NEWTON + matrix[5][5] * data[5] / KILOGRAM_TO_NEWTON;
-    // } else if (g_sys.data_format == 2) {
-    //     g_sensor.force[0] = matrix[0][0] * data[0] + matrix[0][1] * data[1] +
-    //                 matrix[0][2] * data[2] + matrix[0][3] * data[3] +
-    //                 matrix[0][4] * data[4] + matrix[0][5] * data[5];
-
-    //     g_sensor.force[1] = matrix[1][0] * data[0] + matrix[1][1] * data[1] +
-    //                 matrix[1][2] * data[2] + matrix[1][3] * data[3] +
-    //                 matrix[1][4] * data[4] + matrix[1][5] * data[5];
-
-    //     g_sensor.force[2] = matrix[2][0] * data[0] + matrix[2][1] * data[1] +
-    //                 matrix[2][2] * data[2] + matrix[2][3] * data[3] +
-    //                 matrix[2][4] * data[4] + matrix[2][5] * data[5];
-
-    //     g_sensor.force[3] = matrix[3][0] * data[0] + matrix[3][1] * data[1] +
-    //                 matrix[3][2] * data[2] + matrix[3][3] * data[3] +
-    //                 matrix[3][4] * data[4] + matrix[3][5] * data[5];
-
-    //     g_sensor.force[4] = matrix[4][0] * data[0] + matrix[4][1] * data[1] +
-    //                 matrix[4][2] * data[2] + matrix[4][3] * data[3] +
-    //                 matrix[4][4] * data[4] + matrix[4][5] * data[5];
-
-    //     g_sensor.force[5] = matrix[5][0] * data[0] + matrix[5][1] * data[1] +
-    //                 matrix[5][2] * data[2] + matrix[5][3] * data[3] +
-    //                 matrix[5][4] * data[4] + matrix[5][5] * data[5];
-    // }
     int i = 0;
     if (g_sys.data_format == 0) {
         for (i = 0; i < ADC_CHANNEL_NUM; i++) {
@@ -370,7 +298,15 @@ int main(void)
 
     flash_load_all();
 
-    g_sys.data_format = 2;
+    /* Restore the data output unit written by 0x33 (kg) / 0x35 (N).
+       1 → kg, 2 → N, anything else → N. */
+    {
+        uint8_t fmt = 0xFF;
+
+        at24c04_read(DATA_FORMAT_ADDR, &fmt, 1);
+        g_sys.data_format = (fmt == 1 || fmt == 2) ? fmt : 2;
+    }
+
     HAL_TIM_Base_Start_IT(&htim2);   /* Start 1kHz timer */
 
   /* USER CODE END 2 */
@@ -403,7 +339,6 @@ int main(void)
             g_sys.zero_calib_busy = 0;
             calib_zero_over();
             flash_save_zero();
-            uart_debug("Zero calib done — saved to Flash\r\n");
         }
 
         if (g_sys.send_mode == 1) {

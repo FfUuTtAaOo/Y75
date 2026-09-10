@@ -56,6 +56,15 @@ static uint32_t baud_from_code(uint8_t code)
     }
 }
 
+/* Persist the data output unit (1 = kg, 2 = N) at DATA_FORMAT_ADDR so it
+   survives a power cycle.  Only 0x33 and 0x35 store a value; any other
+   content in that byte makes the firmware fall back to 2 (N) on boot. */
+static void data_format_save(uint8_t fmt)
+{
+    uint8_t v = fmt;
+    at24c04_write(DATA_FORMAT_ADDR, &v, 1);
+}
+
 /* Apply a new baud rate: save it to EEPROM, then re-init USART1 and restart
  * DMA reception.  Must be called AFTER the ACK has been transmitted so the
  * host can still read the response at the old baud rate. */
@@ -191,9 +200,10 @@ void rs485_cmd_dispatch(uint8_t cmd, const uint8_t *payload, uint16_t len)
 
     /* ---- 0x06  Query firmware version ---- */
     case RS485_CMD_QUERY_VER:
-        buf[0] = (uint8_t)(g_config.fw_version >> 8);
-        buf[1] = (uint8_t)(g_config.fw_version);
-        respond(cmd, buf, 2);
+        buf[0] = (uint8_t)(g_config.fw_version >> 16);
+        buf[1] = (uint8_t)(g_config.fw_version >> 8);
+        buf[2] = (uint8_t)(g_config.fw_version);
+        respond(cmd, buf, 3);
         break;
 
     /* ---- 0x07  Query system status ---- */
@@ -242,33 +252,19 @@ void rs485_cmd_dispatch(uint8_t cmd, const uint8_t *payload, uint16_t len)
         ack(cmd);
         break;
 
-    /* ---- 0x33  Set data format ---- */
+    /* ---- 0x33  Set data format: kg (persisted) ---- */
     case RS485_CMD_SET_FORMAT_KG:
         g_sys.data_format = 1;
+        data_format_save(1);
         FloatFilter_Init();
         ack(cmd);
         break;
 
-    /* ---- 0x35  Set data format ---- */
+    /* ---- 0x35  Set data format: N (persisted) ---- */
     case RS485_CMD_SET_FORMAT_N:
         g_sys.data_format = 2;
+        data_format_save(2);
         FloatFilter_Init();
-        ack(cmd);
-        break;
-
-    case ETHERCAT_DISABLED:
-        ether_flag = 0;
-        HAL_TIM_Base_Stop_IT(&htim2);
-        HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
-        HAL_NVIC_DisableIRQ(EXTI15_10_IRQn);
-        ack(cmd);
-        break;
-
-    case ETHERCAT_ENABLED:
-        ether_flag = 1;
-        HAL_TIM_Base_Start_IT(&htim2);
-        HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
-        HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
         ack(cmd);
         break;
 

@@ -73,6 +73,9 @@ void uart_debug(const char *msg);
 /* EEPROM address holding the 4-byte (little-endian) UART baud rate */
 #define UART_BAUD_ADDR        0x78
 
+/* EEPROM address holding the 1-byte data output unit (1 = kg, 2 = N) */
+#define DATA_FORMAT_ADDR      0x7C
+
 #define UART_BUFFER_SIZE 64
 
 #define U32_TO_U8(u32, u8, offset)  (u8) = (((u32) >> (offset)) & 0xFF)

@@ -38,7 +38,7 @@ typedef struct {
 /** Persistent configuration (stored in Flash, mirrored in RAM) */
 typedef struct {
     char     sn[16];         /* serial number, null-terminated          */
-    uint16_t fw_version;     /* BCD, e.g. 0x0100 = v1.00               */
+    uint32_t fw_version;     /* BCD, e.g. 0x00010701 = v1.7.1               */
     uint16_t reserved;
 } config_t;
 
