@@ -79,25 +79,6 @@ typedef struct {
 /* ---- 全局自检结果 (extern) ---- */
 extern self_test_t g_self_test;
 
-/* ================================================================
- *  自检 API
- * ================================================================ */
-
-/**
- * 执行完整开机自检，填充 g_self_test 结构体。
- * 应在 HAL 初始化、外设初始化完成后调用，
- * 在 W5500 网络初始化和 RS485 启动之前调用。
- *
- * 调用顺序:
- *   1. self_test_adc()     — LHA7668B SPI 通信 + ID/ERROR 检查
- *   2. self_test_w5500()   — W5500 版本 + PHY 链路
- *   3. self_test_rs485()   — USART/DMA 状态检查
- *   4. self_test_flash()   — Flash 数据完整性 + 矩阵/零点/配置检查
- *
- * @return 0 = 全部通过, 非0 = 有错误 (返回 error_flags)
- */
-uint32_t self_test_run_all(void);
-
 /**
  * 通过 UART 调试串口输出自检报告。
  * 调用 self_test_run_all() 后调用此函数打印结果。
@@ -109,9 +90,6 @@ void self_test_print_report(UART_HandleTypeDef *huart);
 
 /** LHA7668B ADC 自检 */
 uint32_t self_test_adc(void);
-
-/** W5500 以太网自检 */
-uint32_t self_test_w5500(void);
 
 /** RS485 自检 */
 uint32_t self_test_rs485(void);

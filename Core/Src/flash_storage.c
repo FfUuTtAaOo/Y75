@@ -5,21 +5,6 @@
 #include "stm32f1xx_hal.h"
 #include <string.h>
 
-/* ================================================================
- *  Internal helpers — STM32F1 HAL Flash
- * ================================================================ */
-
-static int flash_unlock(void)
-{
-    HAL_FLASH_Unlock();
-    return 1;
-}
-
-static void flash_lock(void)
-{
-    HAL_FLASH_Lock();
-}
-
 /**
  * Erase the storage page.  Must be called with flash unlocked.
  */
@@ -113,7 +98,6 @@ int flash_load_all(void)
  * ================================================================ */
 
 /* Temporary buffer for assembling a full page image */
-static uint8_t page_buf[128];
 
 /* ---- Individual save functions (convenience wrappers) ---- */
 

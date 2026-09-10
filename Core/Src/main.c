@@ -350,7 +350,7 @@ int main(void)
             baud == 19200U  || baud == 9600U) {
             uart1_bsp = baud;
         } else {
-            uart1_bsp = UART_BAUD_0x01;
+            uart1_bsp = 460800;
         }
     }
     CUSTOM_USART1_Init();

@@ -207,22 +207,6 @@ uint32_t self_test_flash(void)
     return 0;
 }
 
-/* ================================================================
- *  完整开机自检
- * ================================================================ */
-uint32_t self_test_run_all(void)
-{
-    uint32_t err = ST_ERR_NONE;
-
-    /* 按顺序执行，后续检查不依赖前面结果 */
-    err |= self_test_adc();
-    err |= self_test_w5500();
-    err |= self_test_rs485();
-    err |= self_test_flash();
-
-    g_self_test.error_flags = err;
-    return err;
-}
 
 /* ================================================================
  *  自检报告打印 (UART 调试输出)
@@ -259,14 +243,6 @@ static void uart_put_dec(UART_HandleTypeDef *huart, uint32_t val)
     }
     buf[pos] = '\0';
     HAL_UART_Transmit(huart, (uint8_t *)buf, (uint16_t)pos, 100);
-}
-
-static void uart_put_ip(UART_HandleTypeDef *huart, const uint8_t ip[4])
-{
-    for (int i = 0; i < 4; i++) {
-        uart_put_dec(huart, ip[i]);
-        if (i < 3) uart_puts(huart, ".");
-    }
 }
 
 static void uart_print_result(UART_HandleTypeDef *huart, const char *label, int ok)

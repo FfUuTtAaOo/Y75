@@ -21,7 +21,7 @@
 #include "usart.h"
 
 /* USER CODE BEGIN 0 */
-uint32_t uart1_bsp = UART_BAUD_0x01;
+uint32_t uart1_bsp = 460800;
 
 int _write(int, char *pBuffer, int len) {
     HAL_UART_Transmit(&huart1, (uint8_t *)pBuffer, len, 500);
