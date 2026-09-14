@@ -10,8 +10,7 @@
 extern "C" {
 #endif
 
-#define ADC_SAMPLING_RATE_0       0
-#define ADC_SAMPLING_RATE_3       3
+#define ADC_SAMPLING_RATE       3
 
 void LHA7668_Platform_Init(void *handle);
 void LHA7668_Platform_Set(const void *port, const uint32_t pin);

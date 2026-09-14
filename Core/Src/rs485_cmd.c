@@ -26,10 +26,10 @@ static void float_to_le(uint8_t *dst, float f)
 
 static float le_to_float(const uint8_t *src)
 {
-    uint32_t u = ((uint32_t)src[3])
-               | ((uint32_t)src[2] << 8)
-               | ((uint32_t)src[1] << 16)
-               | ((uint32_t)src[0] << 24);
+    uint32_t u = ((uint32_t)src[3] << 24)
+               | ((uint32_t)src[2] << 16)
+               | ((uint32_t)src[1] << 8)
+               | ((uint32_t)src[0]);
     float f; memcpy(&f, &u, 4); return f;
 }
 
@@ -54,6 +54,56 @@ static uint32_t baud_from_code(uint8_t code)
     case RS485_BAUD_9600:   return 9600U;
     default:                return 0U;
     }
+}
+
+/* Minimal float → ASCII: "-ddd.dddddd" (6 decimals), NUL-terminated.
+   Written by hand because the firmware links with newlib-nano without
+   -u _printf_float, so snprintf("%f") cannot print floats at all. */
+static int fmt_float(char *dst, int max, float v)
+{
+    static const uint32_t pow10[6] = { 1UL, 10UL, 100UL, 1000UL, 10000UL, 100000UL };
+    uint32_t ip, fp;
+    char tmp[12];
+    int n = 0, k = 0, i;
+
+    if (max < 2) return 0;
+
+    if (v != v) {                                  /* NaN guard */
+        static const char nan_txt[] = "NaN";
+        for (i = 0; nan_txt[i] != '\0' && n < max - 1; i++) {
+            dst[n++] = nan_txt[i];
+        }
+        dst[n] = '\0';
+        return n;
+    }
+
+    if (v < 0.0f) {
+        if (n < max - 1) dst[n++] = '-';
+        v = -v;
+    }
+
+    ip = (uint32_t)v;
+    fp = (uint32_t)((v - (float)ip) * 1000000.0f + 0.5f);
+    if (fp >= 1000000UL) { ip += 1UL; fp = 0UL; }  /* rounding carry */
+
+    do {                                           /* integer part */
+        tmp[k++] = (char)('0' + (ip % 10UL));
+        ip /= 10UL;
+    } while (ip != 0UL && k < (int)sizeof(tmp));
+    while (k > 0 && n < max - 1) {
+        dst[n++] = tmp[--k];
+    }
+
+    if (n < max - 1) dst[n++] = '.';
+
+    for (i = 5; i >= 0; i--) {                     /* 6 decimals, zero-padded */
+        if (n < max - 1) {
+            dst[n++] = (char)('0' + ((fp / pow10[i]) % 10UL));
+        }
+    }
+
+    dst[n] = '\0';
+    return n;
 }
 
 /* Persist the data output unit (1 = kg, 2 = N) at DATA_FORMAT_ADDR so it
@@ -244,6 +294,43 @@ void rs485_cmd_dispatch(uint8_t cmd, const uint8_t *payload, uint16_t len)
         ack(cmd);
         break;
 
+
+    /* ---- 0x37  Query 6×6 decoupling matrix, plain ASCII text ----
+       One line per row, 6 lines total, no binary frame header:
+           matrix1: 0.298418, -0.211604, ...\r\n
+       Row order matches the EEPROM layout and the per-row upload of 0x20. */
+    case RS485_CMD_QUERY_MATRIX: {
+        static const char pfx[] = "matrix";
+        char line[112];
+
+        for (int r = 0; r < 6; r++) {
+            int n = 0;
+            int cap = (int)sizeof(line);
+
+            /* "matrix1: " … "matrix6: " */
+            memcpy(line, pfx, sizeof(pfx) - 1);
+            n  = (int)(sizeof(pfx) - 1);
+            line[n++] = (char)('1' + r);
+            line[n++] = ':';
+            line[n++] = ' ';
+
+            for (int c = 0; c < 6; c++) {
+                n += fmt_float(line + n, cap - n, g_matrix.m[r][c]);
+                if (c != 5) {
+                    if (n < cap - 1) line[n++] = ',';
+                    if (n < cap - 1) line[n++] = ' ';
+                }
+            }
+            if (n < cap - 2) {
+                line[n++] = '\r';
+                line[n++] = '\n';
+            }
+            /* Plain text, no AA 55 header — same style as the 0x05 SN query,
+               so the output is readable as-is in a terminal. */
+            original_send((const uint8_t *)line, (uint16_t)n);
+        }
+        break;
+    }
 
     /* ---- 0x34  Set data format ---- */
     case RS485_CMD_SET_FORMAT:

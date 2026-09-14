@@ -83,7 +83,7 @@ int flash_load_all(void)
         for (j = 0; j < MATRIX_SIZE; j++) {
             offset = j / 4;
             tmp = j % 4;
-            matrix_data_tmp[offset].u32 = U8_TO_U32_SAFE(at24c04_read_buffer[j], matrix_data_tmp[offset].u32, tmp);
+            matrix_data_tmp[offset].u32 = U8_TO_U32_SAFE(at24c04_read_buffer[j], matrix_data_tmp[offset].u32, 3 - tmp);
         }
         for (j = 0; j < 6; j++) {
             g_matrix.m[i][j] = matrix_data_tmp[j].f32;

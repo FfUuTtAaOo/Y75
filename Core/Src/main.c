@@ -64,7 +64,7 @@ volatile sensor_data_t   g_sensor;
 volatile system_state_t  g_sys;
 config_t                 g_config = {
     .sn         = "HS-01234567",
-    .fw_version = 0x00010701,
+    .fw_version = 0x00010702,
 };
 decouple_matrix_t        g_matrix;
 
@@ -288,7 +288,7 @@ int main(void)
     FloatFilter_Init();
     uart_debug("FloatFilter Init OK\r\n");
 
-    lha7668_init(ADC_SAMPLING_RATE_3);
+    lha7668_init(ADC_SAMPLING_RATE);
     uart_debug("LHA7668 OK\r\n");
 
     uart_debug("--- RS485 self-test ---\r\n");

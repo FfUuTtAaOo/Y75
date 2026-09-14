@@ -24,6 +24,7 @@ extern "C" {
 #define RS485_CMD_SET_FREQ      0x08  /* Set frequency: 0=500Hz, 1=1000Hz    */
 #define RS485_CMD_ZERO          0x30  /* Zero calibration (set offsets)      */
 #define RS485_CMD_UNZERO        0x36  /* Cancel zero (clear offsets)         */
+#define RS485_CMD_QUERY_MATRIX  0x37  /* Query the 6×6 matrix (144 bytes)    */
 #define RS485_CMD_HEX_SEND      0x31
 #define RS485_CMD_ASC_SEND      0x32
 #define RS485_CMD_SET_FORMAT_KG 0x33  /* Set data format: 0=mV,1=kg,2=N      */
