@@ -176,12 +176,14 @@ void rs485_send_data_frame(uint8_t cmd)
     }
 
     if (g_sys.debug_mode == 1) {
+        printf("channel:%f, %f, %f, %f, %f, %f\n", g_sensor.force[0], g_sensor.force[1], g_sensor.force[2],
+               g_sensor.force[3], g_sensor.force[4], g_sensor.force[5]);
         /* Debug mode (only 1): [6 × float32 LE] 00 00 80 7F */
-        d[24] = 0x00;
-        d[25] = 0x00;
-        d[26] = 0x80;
-        d[27] = 0x7F;
-        just_float_send_raw(d, 28);
+        // d[24] = 0x00;
+        // d[25] = 0x00;
+        // d[26] = 0x80;
+        // d[27] = 0x7F;
+        // just_float_send_raw(d, 28);
     } else {
         /* debug_mode == 0 — standard HEX frame:
            AA 55 [cmd] [6 × float32 LE] 0D 0A

@@ -81,6 +81,13 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
     # Add user defined libraries
 )
 
+# 允许 printf/sprintf/snprintf 打印浮点数（%f）。
+# newlib-nano 默认把这个格式化器裁掉了，必须显式 -u 拉进来，
+# 代价是 Flash 多占约 10~15 KB。
+target_link_options(${CMAKE_PROJECT_NAME} PRIVATE
+    -u _printf_float
+)
+
 # 添加生成 HEX 和 BIN 的自定义命令
 add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
     COMMAND ${CMAKE_OBJCOPY} -O ihex $<TARGET_FILE:${CMAKE_PROJECT_NAME}> ${CMAKE_PROJECT_NAME}.hex
