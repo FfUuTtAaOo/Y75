@@ -11,10 +11,20 @@ static ringbuf_t           g_rs485_ring;
 static volatile uint8_t    g_rs485_ring_buf[RS485_RX_BUF_SIZE * 2]; /* larger to absorb bursts */
 static volatile uint8_t    g_rs485_rx_running;  /* DMA started flag    */
 
+/*: 关键指针体检失败的次数。>0 说明有东西在踩 .bss（正常恒为 0）。 */
+volatile uint32_t          g_rs485_corrupt;
+
 /* ---- TX helpers ---- */
 
 static void rs485_tx(const uint8_t *data, uint16_t len)
 {
+    /* 句柄被踩坏（NULL / 指向别处）时，HAL 会去读 huart->Instance，
+       而地址 0 是 Flash 别名、第一个字正好是初始 SP（0x20005000），
+       随后访问 0x20005000 就是一次 HardFault。
+       这里宁可丢一帧，也不把 CPU 送进异常。 */
+    if (g_rs485_huart == NULL || g_rs485_huart->Instance != USART1) {
+        return;
+    }
     /* Wait for any previous TX to finish */
     while (__HAL_UART_GET_FLAG(g_rs485_huart, UART_FLAG_TC) == RESET) {}
     HAL_UART_Transmit(g_rs485_huart, (uint8_t *)data, len, 100);
@@ -45,6 +55,10 @@ void rs485_init(UART_HandleTypeDef *huart, rs485_frame_cb frame_cb)
  * ================================================================ */
 void rs485_rx_restart(void)
 {
+    /* 同上：句柄被踩坏时 HAL_UART_DMAStop/Receive_DMA 里会解引用野指针 */
+    if (g_rs485_huart == NULL || g_rs485_huart->Instance != USART1) {
+        return;
+    }
     /* Make sure DMA is not running */
     if (g_rs485_huart->hdmarx) {
         HAL_UART_DMAStop(g_rs485_huart);
@@ -62,9 +76,17 @@ void rs485_rx_restart(void)
 void rs485_rx_idle_cb(uint16_t dma_remaining)
 {
     uint16_t total   = sizeof(g_rs485_rx_dma);
-    uint16_t rx_cnt  = total - dma_remaining;
+    uint16_t rx_cnt;
 
-    if (rx_cnt && rx_cnt <= total) {
+    /* 计数器大于缓冲区长度 = DMA 没被重装（上一批还没重启就被再次触发），
+       此时 total - remaining 会下溢成几万字节，把整圈缓冲灌满脏数据，
+       进而让扫描器从半帧中间对齐 → 解析出随机命令。直接丢弃本批更安全。 */
+    if (dma_remaining > total) {
+        return;
+    }
+    rx_cnt = (uint16_t)(total - dma_remaining);
+
+    if (rx_cnt) {
         ringbuf_write(&g_rs485_ring, (const uint8_t *)g_rs485_rx_dma, rx_cnt);
     }
 
@@ -85,6 +107,13 @@ void rs485_rx_idle_cb(uint16_t dma_remaining)
  * ================================================================ */
 void rs485_process(void)
 {
+    /* 环形缓冲的指针/长度被踩坏时，peek/get 会直接读到 RAM 外面去。
+       发现异常就停手，别让一次内存踩踏变成 HardFault。 */
+    if (g_rs485_ring.buf != g_rs485_ring_buf ||
+        g_rs485_ring.size != sizeof(g_rs485_ring_buf)) {
+        g_rs485_corrupt++;
+        return;
+    }
     while (ringbuf_avail(&g_rs485_ring) >= 4) {   /* minimum: SOF + EOF */
 
         /* ---- Step 1: Align to AA 55 ---- */
@@ -127,7 +156,14 @@ void rs485_process(void)
     }
 
     /* Read payload into a temp buffer */
-    uint8_t payload[RS485_MAX_PAYLOAD];
+    uint8_t payload[RS485_MAX_PAYLOAD] = { 0 };   /* 必须清零：超长帧时下面会跳过读取 */
+    /* 超长帧（多半是半帧/噪声拼出来的）：整段丢弃，绝不派发。
+       否则 payload_len 会原样传给回调用一个未初始化的缓冲区 ——
+       0x20 命令会拿垃圾当行号，写穿 g_matrix 直到踩坏 HAL 句柄。 */
+    if (payload_len > RS485_MAX_PAYLOAD) {
+        ringbuf_skip(&g_rs485_ring, (uint16_t)(eof_pos + 2));
+        return;
+    }
     /* Skip AA + 55 */
     ringbuf_skip(&g_rs485_ring, 2);
     /* Read CMD */

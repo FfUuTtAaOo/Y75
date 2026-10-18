@@ -59,6 +59,10 @@
 /* USER CODE BEGIN PV */
 volatile uint32_t g_tick_ms = 0;
 
+/* 开机以来见过的最低 MSP。HardFault 转储会打印它：
+   若离 .bss 末尾很近，就是栈溢出；否则是野指针。 */
+volatile uint32_t g_min_msp = 0x20005000UL;
+
 /* Shared global state (declared in sensor_types.h) */
 volatile sensor_data_t   g_sensor;
 volatile system_state_t  g_sys;
@@ -175,6 +179,11 @@ void USART1_IRQHandler(void)
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM2) {
+        uint32_t sp = __get_MSP();
+
+        if (sp < g_min_msp) {
+            g_min_msp = sp;               /* 记录栈用过的最深位置 */
+        }
         g_tick_ms++;
 
         if (g_tick_ms % 3 == 0) {

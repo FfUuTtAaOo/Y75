@@ -360,6 +360,11 @@ void rs485_cmd_dispatch(uint8_t cmd, const uint8_t *payload, uint16_t len)
     /* ---- 0x20  Upload decoupling matrix (6×6 × 4 = 144 bytes) ---- */
     case RS485_CMD_SET_MATRIX:
         if (len < 25) { g_sys.comm_error_cnt++; break; }
+        /* 行号必须落在 0..5。少了这道检查，一旦总线噪声/半帧导致 payload
+           是垃圾，g_matrix.m[payload[0]] 会写到数组外最多 6 KB ——
+           正好能踩到 huart1 / hspi1 / htim2 这些 HAL 句柄和函数指针，
+           下一次 HAL 调用直接 HardFault。 */
+        if (payload[0] > 5U) { g_sys.comm_error_cnt++; break; }
         for (int i = 0; i < 6; i++) {
             g_matrix.m[payload[0]][i] = le_to_float(payload + 1 + i * 4);
         }
