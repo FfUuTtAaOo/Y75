@@ -69,7 +69,8 @@ class Device:
                  noise: float = 0.02, matrix_gap: float = 0.0,
                  silent: Optional[set] = None, no_ack: Optional[set] = None,
                  verbose: bool = True, burst_ms: float = 0.0,
-                 short_every: int = 0, rate_hz: float = 0.0):
+                 short_every: int = 0, rate_hz: float = 0.0,
+                 collide: bool = False, baud: int = 460800):
         self.lock = threading.RLock()
         self.order = order
         self.matrix_gap = max(0.0, matrix_gap)
@@ -87,6 +88,22 @@ class Device:
         #: 强制推流节拍（Hz）。真机推流跑在固件主循环里，实测常落在 300~500Hz，
         #: 并不是协议里写的 500/1000 两档；用它复现「节拍不是整数档」的真机条件。
         self.rate_hz = max(0.0, float(rate_hz))
+
+        # ---- 半双工总线冲突模拟（--collide）----
+        #: 真机上 MAX13487 是自动方向芯片，设备正在发推流帧时如果主机的命令
+        #: 也上总线，两个驱动器一起拉 → 双方都收到垃圾，设备侧整帧丢弃、
+        #: 自然也不会回 ACK。打开这个开关，模拟器就按「线上实际占用时间」
+        #: 判定冲突，用来验证上位机的总线仲裁到底有没有用。
+        self.collide = bool(collide)
+        self.baud = max(1200, int(baud))
+        #: 本设备在线上"发"这一批字节的起止时刻（monotonic）
+        self._tx_busy_from = 0.0
+        self.tx_busy_until = 0.0
+        self.collisions = 0                # 撞车次数（命令被丢弃）
+        self.cmd_total = 0                 # 收到的命令总数
+        #: 模拟「线上发完才到应用层」的延迟交付队列（只有 --collide 用）
+        self._tx_q: List[Tuple[float, bytes]] = []
+        self._tx_cv = threading.Condition()
 
         # ---- 运行状态（对应 g_sys） ----
         self.send_mode = 0                 # 0 停 / 1 连续 / 2 单次
@@ -107,6 +124,10 @@ class Device:
         self.seq = 0
         self._clients: List[socket.socket] = []
         self._stop = threading.Event()
+        if self.collide:
+            # 必须在 _stop 建好之后才能起泵线程（循环里要用它判断退出）
+            threading.Thread(target=self._tx_pump, name="tx-wire",
+                             daemon=True).start()
 
     # ------------------------------------------------------------------
     #  采样与推流
@@ -341,6 +362,41 @@ class Device:
 
     def broadcast(self, chunks: List[bytes]) -> None:
         blob = b"".join(chunks)
+        if not blob:
+            return
+        if not self.collide:
+            self._send_all(blob)
+            return
+        # 线上占用窗口 = [现在, 现在 + 传输时间]，10 bit/字节
+        # （1 起始 + 8 数据 + 1 停止），无校验。
+        # 字节**推迟到窗口结束才交付**：UART 边发边转发，最后一个字节到达
+        # 应用层时线上正好发完。不能在这里 sleep —— 那会把推流节拍拖崩，
+        # 反而造出「帧帧背靠背」的假象。交给 _tx_pump 按到期时间发。
+        wire = len(blob) * 10.0 / self.baud
+        now = time.monotonic()
+        start = max(now, self.tx_busy_until)
+        self._tx_busy_from = start
+        self.tx_busy_until = start + wire
+        with self._tx_cv:
+            self._tx_q.append((start + wire, blob))
+            self._tx_cv.notify()
+
+    def _tx_pump(self) -> None:
+        """按「线上发完」的时刻把字节交出去（模拟 UART 的边发边转发）。"""
+        while not self._stop.is_set():
+            with self._tx_cv:
+                if not self._tx_q:
+                    self._tx_cv.wait(0.002)
+                    continue
+                due, blob = self._tx_q[0]
+                wait = due - time.monotonic()
+                if wait > 0:
+                    self._tx_cv.wait(wait)
+                    continue
+                self._tx_q.pop(0)
+            self._send_all(blob)
+
+    def _send_all(self, blob: bytes) -> None:
         with self.lock:
             dead = []
             for c in self._clients:
@@ -382,6 +438,7 @@ class Device:
             now = time.monotonic()
             if next_t is None or next_t < now - 0.5:      # 刚开始 / 落后太多就重排
                 next_t = now
+
             if next_t > now:
                 self._stop.wait(min(0.002, next_t - now))
                 continue
@@ -456,6 +513,20 @@ class Device:
             del buf[:end + 2]
             cmd = frame[2]
             payload = frame[3:end]
+            self.cmd_total += 1
+
+            # ---- 半双工撞车：命令正好落在设备往线上发字节的那一段 ----
+            if (self.collide
+                    and self._tx_busy_from <= time.monotonic() <= self.tx_busy_until):
+                self.collisions += 1
+                self.log(f"!! {hexs(frame)} 撞车（设备正在发送），命令被丢弃")
+                # 两边驱动器对着拉，主机收到的也会是垃圾字节
+                try:
+                    sock.sendall(b"\xA5\x5A")
+                except OSError:
+                    return
+                continue
+
             self.log(f"← {hexs(frame)}   [{frame_text(cmd)}]")
             try:
                 chunks = self.handle_payload(cmd, payload)
@@ -465,10 +536,9 @@ class Device:
             if not chunks:
                 continue
             for i, ch in enumerate(chunks):
-                try:
-                    sock.sendall(ch)
-                except OSError:
-                    return
+                # 回复同样占线路：真机是单发射器，ACK 会挤进帧间空隙，
+                # 而不是「凭空出现在总线上」
+                self.broadcast([ch])
                 if self.matrix_gap and cmd == CMD_QUERY_MATRIX and i < len(chunks) - 1:
                     time.sleep(self.matrix_gap)           # 人为拉开，测上位机文本拼接
 
@@ -511,6 +581,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="强制推流节拍（Hz），覆盖 --freq。真机推流跑在固件主循环里，"
                          "实测常在 330Hz 左右而不是 500Hz，用它可以复现真机的节拍")
     ap.add_argument("--selftest", action="store_true", help="跑内部自检后退出")
+    ap.add_argument("--collide", action="store_true",
+                    help="模拟半双工总线冲突：设备正在往线上发字节时收到的命令"
+                         "一律丢弃（不回 ACK）并往流里插垃圾字节 —— 用来验证"
+                         "上位机的「发送前等总线空闲」到底有没有用")
+    ap.add_argument("--baud", type=int, default=460800,
+                    help="--collide 判定「线上占用时间」用的波特率（默认 460800）")
     return ap
 
 
@@ -541,7 +617,8 @@ def run(args) -> int:
                  matrix_gap=args.matrix_gap,
                  silent=_parse_cmds(args.silent), no_ack=_parse_cmds(args.no_ack),
                  verbose=not args.quiet, burst_ms=args.burst_ms,
-                 short_every=args.short_frames, rate_hz=args.rate_hz)
+                 short_every=args.short_frames, rate_hz=args.rate_hz,
+                 collide=args.collide, baud=args.baud)
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -552,6 +629,9 @@ def run(args) -> int:
             f"字节序={args.order}  默认频率={args.freq}Hz  噪声={args.noise}"
             + (f"  批量上报={args.burst_ms:g}ms" if args.burst_ms > 0 else "")
             + (f"  畸形帧=每{args.short_frames}帧插1个" if args.short_frames else ""))
+    if args.collide:
+        dev.log(f"⚠ 总线冲突模拟已开启：设备发送窗口内收到的命令一律丢弃"
+                f"（按 {args.baud} 波特率折算线上占用时间）")
     dev.log("协议：AA 55 [CMD] [PAYLOAD] 0D 0A   —— 真机走 RS485，"
             "这里走 TCP，字节流一致")
 

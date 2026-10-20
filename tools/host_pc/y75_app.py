@@ -75,8 +75,18 @@ OUT_ASC = "ASC 调试帧"
 
 #: 波形刷新率（标签是 fps，值是毫秒周期）。
 #: 越高越顺滑、越费 CPU：老机器或同时开很多东西时往下调。
-REFRESH_CHOICES = ("20", "25", "30", "40", "50")
-REFRESH_DEFAULT = "40"
+REFRESH_CHOICES = ("20", "25", "30", "40", "50", "60")
+REFRESH_DEFAULT = "50"
+
+#: 横轴模式（界面下拉的文字 ↔ WaveCanvas 的 X_TIME / X_POINTS）
+X_MODE_LABELS = ("时间 (s)", "点数")
+X_MODE_TIME_LABEL, X_MODE_PTS_LABEL = X_MODE_LABELS
+#: 时间模式下可选的跨度（秒）
+SPAN_SEC_CHOICES = ("1", "2", "5", "10", "20")
+#: 点数模式下可选的跨度（点）。上限 20000 = 波形缓冲 WAVE_MAX 的容量，
+#: 再大就只能拿到缓冲里剩下的那点，标尺会名不副实。
+SPAN_PTS_CHOICES = ("1000", "2000", "5000", "10000", "20000")
+SPAN_PTS_DEFAULT = 2000
 
 
 def refresh_to_ms(label: str) -> int:
@@ -85,6 +95,18 @@ def refresh_to_ms(label: str) -> int:
     except (TypeError, ValueError):
         fps = int(REFRESH_DEFAULT)
     return max(10, int(round(1000.0 / max(1, fps))))
+
+
+# =====================================================================
+#  总线仲裁设置：界面的 StringVar → 客户端的 BusGate
+# =====================================================================
+def apply_bus_cfg(cli, cfg: dict) -> None:
+    """把一组（已经脱离 Tk 变量的）纯数值写进客户端的 BusGate。"""
+    bus = cli.bus
+    bus.enabled = bool(cfg.get("bus_wait", True))
+    bus.window_ms = max(0.0, float(cfg.get("bus_window", 0.0) or 0.0))
+    bus.max_wait_ms = max(0.0, float(cfg.get("bus_maxwait", 250.0) or 0.0))
+    cli.bus_retry = max(0, min(3, int(cfg.get("bus_retry", 0) or 0)))
 
 
 FMT_CHOICES = (("原始数据 (mV)", 0), ("矩阵解耦 (kg)", 1), ("矩阵解耦 (N)", 2))
@@ -143,11 +165,28 @@ class WaveCanvas(tk.Canvas):
     4. 图元复用
        不再每帧 delete("all") 重建 40 多个图元，只对自己的曲线做
        coords() 更新；网格/坐标轴/图例只在尺寸、时间窗或单位变化时重排。
+
+    横轴有两种模式（界面上可切换）：
+
+    * **时间（s）** —— 窗口 = N 秒，刻度写秒；
+    * **点数** —— 窗口 = N 个采样点（1000~20000），刻度直接写点数。
+      设备实测节拍并不是协议里写的 500/1000Hz（常在 300~500Hz 之间漂），
+      按点数看波形时，一个周期占多少点、两帧之间到底隔几点，都是确定的
+      —— 做频谱/找节拍/数点对齐时比秒更直观。
+
+    **两种模式的横轴位置算法完全相同，而且只看点数、完全不看时间戳**：
+    维护一个「右边界落后最新样点多少个点」的量，每帧按平滑后的帧周期推进，
+    再用速度微调拉回目标落后量（= 显示延迟换算成的点数）。
+    这样设备时钟怎么漂、怎么重锚，画面都不会跳 —— 见 draw() 第 1b 节。
     """
 
+    #: 横轴模式
+    X_TIME = "time"
+    X_POINTS = "pts"
+
     PAD_L, PAD_R, PAD_T, PAD_B = 66, 14, 16, 28
-    #: 两次重画的最小间隔（≈45fps 上限），用来吸收 resize 风暴
-    MIN_DT = 0.020
+    #: 两次重画的最小间隔（≈83fps 上限），用来吸收 resize 风暴
+    MIN_DT = 0.012
     #: Y 轴收缩速度：每帧向目标量程靠拢这么多（扩张是瞬时的）
     SHRINK_K = 0.10
     #: 显示延迟（秒）：数据先攒进缓冲，波形按本地时钟匀速回放。
@@ -156,7 +195,12 @@ class WaveCanvas(tk.Canvas):
     #: 有货，右边界才能匀速前进，与数据到达节奏彻底解耦。
     #: 实际延迟 = max(LATENCY_MIN, 实测样本年龄峰值 + LATENCY_MARGIN)，
     #: 见 draw()。TCP 回环时样本年龄≈0，延迟就取 LATENCY_MIN。
-    LATENCY_MIN = 0.05
+    #:
+    #: 30ms 的来历：CH340 把 Latency Timer 调到 1ms 后，实测「接收批间隔」
+    #: 只有 9.9ms，样本年龄峰值约 10~13ms，加上 15ms 余量就是 25~28ms。
+    #: 原来写 50ms 时白白多压了 20ms 的滞后（手感上很实在）。
+    #: 真遇到驱动更糟的机器，自适应会按实测峰值自动抬上去，不会因此卡住。
+    LATENCY_MIN = 0.03
     #: 自适应延迟的余量：盖住两次测量之间新出现的抖动，别让夹子擦到边
     LATENCY_MARGIN = 0.015
     #: 样本年龄峰值的衰减时间常数（秒）。链路变干净后延迟按它回落。
@@ -170,12 +214,40 @@ class WaveCanvas(tk.Canvas):
         super().__init__(master, bg=CARD, highlightthickness=1,
                          highlightbackground=EDGE, **kw)
         self.window_sec = float(window_sec)
+        #: 横轴模式（X_TIME / X_POINTS）
+        self.x_mode = self.X_TIME
+        #: 点数模式的窗口点数（相邻点等间距铺满宽度）
+        self.window_pts = 2000
+        #: 实测采样间隔（秒），点数模式用它把时间换算成点
+        self.dt_est = 0.0
         self.enabled = [True] * 6
         self.unit = "N"
 
         self._font = "TkDefaultFont"
-        self._t_end: Optional[float] = None      # 平滑推进的时间轴右边界
+        self._t_end: Optional[float] = None      # 右边界对应的设备时刻（仅统计用）
+        #: 时间轴右边界的目标值。只许往前（延迟自适应抖动时不许往回拉）
+        self._t_target: Optional[float] = None
+        #: 右边界所在的**绝对采样序号**（自本次连接起累计）。横轴位置的唯一
+        #: 来源：每帧按速度积分前进，与数据到货节奏、时间戳都无关（draw 1b）
+        self._pos_abs: Optional[float] = None
+        #: 当前切片首点的绝对序号（= count - n_all）。切片被裁剪时自动补偿
+        self._base = 0.0
+        #: 右边界落后最新样点多少个点（诊断/统计用）
+        self._back: Optional[float] = None
+        #: 右边界当前的浮点索引（只给基准脚本/诊断看，绘制不依赖它）
+        self._idx_pos = 0.0
         self._mono = 0.0                         # 上次重画的 monotonic 时刻
+        #: 平滑后的帧周期（秒）。见 draw()：位移用它，而不是本帧实测间隔
+        self._dt_smooth = 0.0
+        #: 时间模式定格的窗口点数（见 draw()：不跟 dt_est 每帧抖）
+        self._np_time: Optional[float] = None
+        self._np_time_src = 0.0
+        #: True = 上面那个值是在「还没量到节拍」时用标称 500Hz 凑的，下一帧重定格
+        self._np_time_prov = False
+        #: 数据速率（点/秒），由**累计帧计数**的增量算出，见 _measure_rate()
+        self._rate_pts = 0.0
+        self._rate_t: Optional[float] = None
+        self._rate_head = 0.0
         #: 自适应显示延迟：最新样本「年龄」的峰值跟踪（秒）
         self._age_peak = 0.0
         self._newest_seen = 0.0
@@ -215,9 +287,97 @@ class WaveCanvas(tk.Canvas):
         self.window_sec = float(v)
         self.reset(replot=True)
 
+    def set_x_mode(self, mode: str) -> None:
+        """切换横轴：时间 ↔ 点数。右边界与量程都重起，避免拿旧标尺套新数据。"""
+        if mode not in (self.X_TIME, self.X_POINTS) or mode == self.x_mode:
+            return
+        self.x_mode = mode
+        self.reset(replot=True)
+
+    def set_window_pts(self, n: int) -> None:
+        """换点数窗。范围夹到 100~100000，免得手滑输个 0 把除零打出来。"""
+        n = int(max(100, min(100000, int(n))))
+        if n == self.window_pts:
+            return
+        self.window_pts = n
+        self.reset(replot=True)
+
+    def span_sec(self) -> float:
+        """
+        当前横轴覆盖多少**秒**。
+
+        时间模式就是 window_sec；点数模式是「点数 × 实测采样间隔」。
+        取数据时按它多要一截，保证右边界那段延迟里的点也拿得到。
+        """
+        if self.x_mode == self.X_TIME:
+            return self.window_sec
+        dt = self.dt_est if self.dt_est > 0.0 else 1.0 / 500.0
+        return max(self.window_pts * dt, 0.001)
+
+    def _measure_rate(self, head_abs: float, now: float) -> None:
+        """
+        实测数据速率（点/秒）：累计帧计数的增量 ÷ 墙钟增量，EMA 平滑。
+
+        **横轴位置只信这个数，不信 dt_est。** dt_est 是从帧时间戳算出来的，
+        而真机时间戳会被两处逻辑动过：`|now − _dev_t| > 0.4s` 就重锚、
+        超前 TS_AHEAD 就硬拉回。一旦被带偏，`dt_s/dt_est` 能算错几十倍，
+        画面要么狂奔要么冻住。帧计数是单调递增的整数，绝对可靠。
+        """
+        if self._rate_t is not None:
+            span = now - self._rate_t
+            if span > 1e-4:
+                inst = (head_abs - self._rate_head) / span
+                if 0.5 < inst < 200000.0:      # 0.5Hz~200kHz 之外不采信
+                    self._rate_pts = (inst if self._rate_pts <= 0.0
+                                      else self._rate_pts * 0.9 + inst * 0.1)
+        self._rate_t, self._rate_head = now, head_abs
+
+    def _pt_rate(self) -> float:
+        """当前数据速率（点/秒）。还没量到时退回 dt_est，再退回标称 500Hz。"""
+        if self._rate_pts > 0.0:
+            return self._rate_pts
+        if self.dt_est > 0.0:
+            return 1.0 / self.dt_est
+        return 500.0
+
+    def np_win(self) -> float:
+        """一屏覆盖多少个采样点 —— 时间/点数两种模式的**唯一口径**。"""
+        if self.x_mode == self.X_POINTS:
+            return float(max(2, int(self.window_pts)))
+        if (self._np_time is not None and not self._np_time_prov
+                and self._np_time_src == self.window_sec):
+            return self._np_time
+        return max(2.0, self.window_sec * self._pt_rate())
+
+    def want_points(self) -> int:
+        """
+        重绘需要多少个样点。**两种模式都按个数取，绝不按时间戳取。**
+
+        老实现时间模式用 `take_wave(window_sec)`，那是按时间戳切的
+        （`t0 = wave[-1][0] − window_sec`）。真机上 `wave[-1][0]` 是设备时钟
+        推算值，会被重锚/硬拉 —— 它一跳，切出来的**样本个数**就跟着变，
+        draw() 里「绝对序号 → 切片下标」的换算基准 `_base` 随之突跳，
+        整条曲线往左甩一截再慢慢爬回来，看着就是「点从最右边重新刷到左边」。
+        TCP 模拟器节拍精确、从不重锚，所以永远复现不出来。
+
+        按个数取之后 `n_all` 只跟帧计数有关，`_base` 是纯粹的计数差，
+        时间戳怎么跳都动不了画面。
+        """
+        rate = self._pt_rate()
+        # 右边界落后最新点 lag_pts 个点（= 显示延迟 × 速率），上限按
+        # LATENCY_MAX 留；再垫 128 个点给抽稀步长和右端补点。
+        return int(self.np_win()) + int(self.LATENCY_MAX * rate) + 128
+
     def reset(self, replot: bool = False) -> None:
         """清掉时间轴与量程（断线、重连、换时间窗时用）。"""
         self._t_end = None
+        self._t_target = None
+        self._pos_abs = None                    # 横轴位置重新起算（见 draw 1b）
+        self._back = None
+        self._np_time = None                    # 时间模式窗口点数重新定格
+        self._np_time_prov = False
+        self._rate_pts = 0.0                    # 数据速率重新实测
+        self._rate_t = None
         self._lo = self._hi = None
         self._ylab_txt = [None] * 5
         self._age_peak = 0.0
@@ -309,8 +469,8 @@ class WaveCanvas(tk.Canvas):
                                       text="", state="hidden")
 
     def _ensure_placed(self, w: int, h: int) -> None:
-        """网格/坐标轴/图例只在尺寸、时间窗或单位变化时重排（约 35 次 Tcl 调用）。"""
-        sig = (w, h, self.window_sec, self.unit)
+        """网格/坐标轴/图例只在尺寸、跨度或单位变化时重排（约 35 次 Tcl 调用）。"""
+        sig = (w, h, self.window_sec, self.window_pts, self.x_mode, self.unit)
         if sig == self._placed:
             return
         self._placed = sig
@@ -331,9 +491,14 @@ class WaveCanvas(tk.Canvas):
         for i, tx in enumerate(it["ylab"]):
             self.coords(tx, pad_l - 7, pad_t + ph * i / 4)
         for i, tx in enumerate(it["xlab"]):
-            rel = -self.window_sec + self.window_sec * i / 5
             self.coords(tx, pad_l + pw * i / 5, pad_t + ph + 13)
-            self.itemconfigure(tx, text=f"{rel:+.1f}s")
+            if self.x_mode == self.X_POINTS:
+                # 点数轴：右端 = 最新一点（0），往左数。整数，别给小数丢人。
+                self.itemconfigure(
+                    tx, text=f"{int(round(-self.window_pts + self.window_pts * i / 5))}")
+            else:
+                rel = -self.window_sec + self.window_sec * i / 5
+                self.itemconfigure(tx, text=f"{rel:+.1f}s")
 
         x = pad_l + 10
         for i in range(6):
@@ -353,12 +518,25 @@ class WaveCanvas(tk.Canvas):
     #  绘制
     # ------------------------------------------------------------------
     def draw(self, samples: List[Tuple[float, Tuple[float, ...]]],
-             force: bool = False) -> None:
+             force: bool = False, count: Optional[int] = None) -> None:
         now = time.monotonic()
         if not force and now - self._mono < self.MIN_DT:
             return
         dt = now - self._mono if self._mono else 0.0
         self._mono = now
+        # ---- 帧周期平滑 ----
+        # Tk 的 after() 在 Windows 上并不准：设定 20ms，实测在 20~42ms 之间
+        # 抖（变异系数 20%+）。而屏幕上的位移就是「本帧间隔 × 速度」——
+        # 拿实测间隔直接算，等于把定时器的抖动原样画出来：这一帧走 3 像素、
+        # 下一帧走 6 像素，眼睛看到的就是「走一格、停一拍」的定格感。
+        # 用 EMA 滤掉单帧抖动后，每帧走一样多；长期均值仍等于真实帧周期，
+        # 不会与本地时钟漂开（残余误差由下面的 rate 修正兜着）。
+        if 0.0 < dt < 0.5:
+            self._dt_smooth = (dt if self._dt_smooth <= 0.0
+                               else self._dt_smooth * 0.82 + dt * 0.18)
+        if self._dt_smooth <= 0.0:
+            self._dt_smooth = self.MIN_DT
+        dt_s = self._dt_smooth
         self._draw_times.append(now)
         if len(self._draw_times) >= 4:
             ts = list(self._draw_times)
@@ -425,59 +603,148 @@ class WaveCanvas(tk.Canvas):
         self.latency = (latency if self.latency <= 0.0
                         else self.latency + (latency - self.latency) * 0.1)
 
-        target = wall - latency
-        if self._t_end is None:
-            self._t_end = min(newest, target)
+        n_all = len(samples)
+
+        # ---- 1b. 横轴位置：绝对点数积分，不看时间戳、也不看「这批到了几点」 ----
+        #
+        # 这是「每次都从头重新加载」的根治办法。老实现有三个致命耦合：
+        #
+        #   ① 右边界 = t_end（**本机时钟**口径），却拿它跟 newest（**设备时钟
+        #      推算值**）相夹。真机推流率 300~500Hz 而 sample_dt 按 500Hz 推算，
+        #      几秒钟就差几十毫秒 → `t_end = newest` 把右边界整体往回拽 →
+        #      整条曲线猛跳一截、再花十几秒爬回去，看着就是「从头重来」。
+        #   ② 右边界 = n_all - back。n_all 只在**数据到货**那一刻跳变（USB 驱动
+        #      9.9ms 一批、5 帧一跳），所以没有新帧的那几帧位置纹丝不动、到货
+        #      那帧整批跳一次 —— 这就是「一格一格 / 像在重新加载」。
+        #   ③ 时间模式下 n_all 是**按时间戳切**出来的（见 want_points 的说明），
+        #      设备时钟一重锚，切片长度就变，换算基准 _base 跟着突跳 →
+        #      「点从最右边重新刷到左边」。这是真机独有、TCP 模拟复现不了的。
+        #
+        # 现在：样本一律**按个数**取（n_all 只跟帧计数有关），位置是一个
+        # **绝对采样序号**的积分，速率也由帧计数实测（_measure_rate）。
+        #   * 与时间戳无关 → 设备时钟漂移、重锚、停止/开始，画面都不动；
+        #   * 与到货节奏无关 → 数据一批一批来，画面照样匀速走；
+        #   * 位置是速度的积分，永远不会突跳（除了断流后重锚）。
+        head_abs = (count - 1) if count is not None else (n_all - 1)
+        self._measure_rate(head_abs, time.monotonic())
+        rate = self._pt_rate()                      # 点/秒，实测帧计数得来
+        if self._rate_pts > 0.0:
+            # 采样周期只从帧计数导出，**绝不从帧时间戳算**。真机时间戳会被
+            # 协议层的兜底路径按 sample_dt*0.05 挤压（设备时钟跑到本机时间
+            # 前面时），连续触发就能让「相邻间隔中位数」从 2ms 塌到 0.1ms；
+            # 而一屏点数 = window_sec/dt_est，当场从 2500 变成 50000 ——
+            # 整条曲线被压到右边缘、再随数据往左扫，就是「点从最右边刷到
+            # 左边」。TCP 模拟器时间戳永远规整，所以复现不出来。
+            self.dt_est = 1.0 / self._rate_pts
+        pts = dt_s * rate                           # 本帧「应该」走过多少个点
+        lag_pts = max(6.0, latency * rate)          # 目标落后量（显示延迟换算成点）
+        if self._pos_abs is None or head_abs + lag_pts < self._pos_abs - 1.0:
+            # 首次，或累计帧数倒退（重连后 count 从 0 重来）→ 重新起算
+            self._pos_abs = float(head_abs) - lag_pts
         else:
-            self._t_end += dt                      # 按真实经过时间自然前进
-            err = target - self._t_end
-            if abs(err) > 0.4:
-                self._t_end += err                 # 断流 / 系统时钟跳变 → 重新对齐
-            else:
-                self._t_end += err * 0.25          # 其余柔性纠偏，不产生可见跳变
-            if self._t_end > newest:
-                # 兜底：链路出现远超近期峰值的尖峰停顿（如固件写 Flash）。
-                # 自适应延迟下这里几乎不会触发；真触发了也只说明「确实没有新数据」。
-                self._t_end = newest               # 数据不够新 → 停住，右侧不留空白
-                self.clamp_n += 1
-                self.clamp_sec += dt
-        t_end = self._t_end
-        t_start = t_end - self.window_sec
+            err_pts = (head_abs - lag_pts) - self._pos_abs
+            # 误差 1 点改 2% 速度，最多 ±35%。长期平均速度 = 数据速率，
+            # 所以不会越跑越偏；瞬时速度平滑，屏幕上就是匀速平移。
+            speed = 1.0 + max(-0.35, min(0.35, err_pts * 0.02))
+            self._pos_abs += pts * speed
+        # 绝对序号 → 当前切片里的下标（切片被裁剪时 _base 会跟着变，自动补偿）
+        self._base = float(head_abs - (n_all - 1))
+        idx_end = self._pos_abs - self._base
+        if idx_end > n_all - 1:
+            # 数据没跟上（断流 / 掉帧）：停住，右侧不留空白
+            idx_end = float(n_all - 1)
+            self._pos_abs = idx_end + self._base
+            self.clamp_n += 1
+            self.clamp_sec += dt
+        if idx_end < 0.0:
+            idx_end = 0.0
+            self._pos_abs = self._base
+        self._back = float(head_abs) - self._pos_abs
+        if self._back > max(2.0 * rate, lag_pts * 8.0):
+            # 断流超过 2 秒：此时屏幕右侧早就空了，重锚不会有可见跳变
+            self._back = lag_pts
+            self._pos_abs = float(head_abs) - lag_pts
+        idx_end = max(0.0, min(idx_end, float(n_all - 1)))
+        self._idx_pos = idx_end          # 右边界在缓冲里的浮点索引（诊断用）
 
-        # 裁出可视区间。两头都要裁：
-        #   左边 = 时间窗左端；
-        #   右边 = **时间轴右端**，不是「最新样点」。
-        # 不裁右边的话，曲线会一直画到最新样点（比时间轴超前 LATENCY），
-        # 实测能画出右边界之外 18px 并被控件边缘硬切掉 —— 网格在匀速滑、
-        # 曲线尾巴却顶在窗口最右边不动，两者对不上，看着就别扭。
-        # 因为上面已保证 t_end ≤ newest，裁到 t_end 绝不会在右边留空白。
-        i0 = bisect_left(samples, (t_start,))
-        i1 = bisect_right(samples, (t_end,))
-        if i1 <= i0:
-            i1 = min(len(samples), i0 + 1)
-        vis = samples[i0:i1]
-        if not vis:
-            vis = samples[-1:]
-
-        # ---- 2. 抽稀：把整个宽度铺满，**一个像素最多一个点** ----
+        # 抽稀上限：把整个宽度铺满，**一个像素最多一个点**。
         # 超过 1 点/像素的画面对眼睛没有增益，但 Tk 画 2px 宽的折线是按填充多边形
         # 走的，点多一倍重绘就贵一倍（实测 1250 点 6.6ms / 2500 点 22ms）。
         # 上限 1400：4K 屏上波形拉到 3000+ 像素宽时，若无上限 6 条曲线要画
         # 近 2 万个点，draw() 会从 2ms 涨到 20ms+，整帧率直接腰斩 ——
         # Modbus-TCP 版就是用 800 点硬顶住才一直顺的。
-        n = len(vis)
         max_pts = min(max(int(pw), 128), 1400)
-        step = max(1, -(-n // max_pts))
-        if step == 1:
-            pts = vis
-        else:
-            pts = vis[::step]
-            if (len(pts) - 1) * step != n - 1:
-                pts = pts + vis[-1:]
+
+        def _step(n: int) -> int:
+            """
+            抽稀步长。
+
+            整数步长有个坑：只要 n 比像素数多一点点，步长就从 1 跳到 2，
+            画出来的点当场少一半（1000 点铺 847px 只剩 500 点，肉眼可见变糙）。
+            所以先允许到 1.4 点/像素（Tk 这点开销实测只多 1~2ms），
+            真超了才按 n/max_pts 整步抽稀。
+            """
+            if n <= int(max_pts * 1.4):
+                return 1
+            return max(1, -(-n // max_pts))
+
+        # ---- 2. 横轴：统一按「采样点序号」铺 ----
+        # 时间模式和点数模式画法**完全一样**：相邻点严格等间距，区别只在
+        # 刻度文字——一个把「第几个点」换算成秒，一个直接写点数。
+        #
+        # 为什么不拿帧时间戳当 x？（这是「串口卡、TCP 顺」的真正原因）
+        # 串口路径上帧时间戳是「设备时钟推算值」。USB 驱动一批 5 帧一起交上来，
+        # 推算步长（实测 sample_dt）只要有 1% 误差，几百帧后就与本地时钟错开
+        # 几十毫秒，于是被「超前 >80ms 就拉回」的护栏硬拽一下 —— 那一瞬间
+        # 相邻点的间距突然变短，整条曲线在水平方向被「收一下再放开」。
+        # 单次只有几毫秒，但隔十几秒来一次，看着就是「数据从前面被推到后面」。
+        # TCP 回环没有 USB 缓冲，时间戳不起伏，所以从来没这毛病。
+        #
+        # 按序号铺则彻底免疫：点间距严格相等，右边界是一个匀速推进的**浮点
+        # 索引**，屏幕上就是像素级的匀速平移，与数据怎么到达完全无关。
+        # 时间模式的窗口点数在「量到速率之后」定格一次，之后不再每帧微抖：
+        # 速率的 0.1% 抖动会让 kx（每点像素）变化 → 每个点的取整结果变 →
+        # 曲线**形状**每帧都在抖，这就是「擦掉重画感」的最后一块拼图。
+        if self.x_mode == self.X_TIME and (
+                self._np_time is None or self._np_time_prov
+                or self._np_time_src != self.window_sec):
+            self._np_time = max(2.0, self.window_sec * rate)
+            # 还没实测到速率（第一帧）时先用标称值顶着，量到后立刻重定格一次：
+            # 真机推流率常在 300~500Hz，一直用 500Hz 算会让「5 秒」显示成 7.5 秒
+            self._np_time_prov = (self._rate_pts <= 0.0)
+            self._np_time_src = self.window_sec
+        np_win = self.np_win()
+        self._idx_pos = idx_end          # 右边界在切片里的浮点索引（诊断用）
+        x0 = idx_end - (np_win - 1.0)                    # 左端索引（一屏正好 np_win 个点）
+        kx = pw / (np_win - 1.0)                         # 每个点占多少像素
+
+        k_hi = min(n_all, int(idx_end) + 1)              # 右端不越过右边界
+        n_vis = k_hi - max(0, int(x0 // 1))
+        step = _step(n_vis)
+        # 取样起点必须落在 **step 的全局网格** 上。若只对齐到「本帧的 x0」，
+        # 相邻两帧同一序号对应的物理点会错开 —— 同序号位移不一致，曲线形状
+        # 依然在抖。对齐到网格后，两帧的点集是同一条网格线的整体平移。
+        k_lo = max(0, (int(x0 // 1) // step) * step)
+        if k_hi <= k_lo:
+            k_lo, k_hi = max(0, n_all - 1), n_all
+        ks = list(range(k_lo, k_hi, step))
+        if ks and ks[-1] != k_hi - 1:
+            ks.append(k_hi - 1)                          # 抽稀也要保住最后一个点
+        # ---- 整像素量子化：形状稳定的最后一块拼图 ----
+        # 每个点的 x = pad_l + (k - x0)·kx，k 是整数、kx 不是，所以 x 的小数
+        # 部分**只由 k 决定**。若 x0 也带小数（每帧都在变），Tk 对每个点独立
+        # 取整后，相邻两帧的取整结果各不相同 → 曲线**形状**每帧都在轻微抖动，
+        # 看起来不像"平移"而像"擦掉重画"。把 x0 量子化到整数像素后，取整
+        # 形状完全锁定，每帧只剩一个整体的整数像素平移——这是 Tk 的物理极限，
+        # 跨度大、每帧位移不足 1px 时必然一格一格，任何渲染技巧都救不了，
+        # 只能把跨度调小让每帧位移 ≥2px 才会真正"丝滑"。
+        x0 = round(x0 * kx) / kx
+        xs = [pad_l + (k - x0) * kx for k in ks]
+        ys = [samples[k][1] for k in ks]
 
         # ---- 3. 量程：扩张瞬时、收缩缓慢 ----
         lo, hi = float("inf"), float("-inf")
-        for _t, vals in pts:
+        for vals in ys:
             for i in active:
                 v = vals[i]
                 if v < lo:
@@ -503,7 +770,6 @@ class WaveCanvas(tk.Canvas):
         self._set_ylabels(lo, hi)
         self._set_hint(False)
 
-        px_per_sec = pw / self.window_sec
         y_scale = ph / (hi - lo)
         for i in range(6):
             if not self.enabled[i]:
@@ -511,8 +777,8 @@ class WaveCanvas(tk.Canvas):
                 continue
             coords: List[float] = []
             ap = coords.append
-            for t, vals in pts:
-                ap(pad_l + (t - t_start) * px_per_sec)
+            for x, vals in zip(xs, ys):
+                ap(x)
                 ap(pad_t + (hi - vals[i]) * y_scale)
             if len(coords) >= 4:
                 self.coords(it["curve"][i], *coords)
@@ -640,8 +906,9 @@ class App:
         left_outer.grid(row=1, column=0, sticky="ns")
         left_outer.rowconfigure(0, weight=1)
         left_outer.columnconfigure(0, weight=1)
+        # 不加 yscrollincrement：那会把拖滚动条量化成 20px 一跳，手感就是「卡卡的」
         self.left_canvas = tk.Canvas(left_outer, bg=BG, highlightthickness=0, bd=0,
-                                     width=316, yscrollincrement=20)
+                                     width=316)
         sb = ttk.Scrollbar(left_outer, orient="vertical", command=self.left_canvas.yview)
         self.left_canvas.configure(yscrollcommand=sb.set)
         self.left_canvas.grid(row=0, column=0, sticky="nsew")
@@ -649,8 +916,12 @@ class App:
         self.left_sb = sb
         left = ttk.Frame(self.left_canvas, padding=(10, 10, 6, 10))
         win = self.left_canvas.create_window((0, 0), window=left, anchor="nw")
-        left.bind("<Configure>",
-                  lambda e: self.left_canvas.configure(scrollregion=self.left_canvas.bbox("all")))
+        # scrollregion 只能取「内容自身尺寸」。用 bbox("all") 会把**已移动**的
+        # 内框位置算进去：每拖一格滚动条就改写一次滚动域 → 视图再被夹一次 →
+        # 一次鼠标事件里窗口搬好几回（卡顿 + Windows 上留下重影），而且越滚
+        # 滚动域越缩、真底部永远滚不到。
+        self._left_sr = None
+        left.bind("<Configure>", self._sync_left_scrollregion)
         self.left_canvas.bind("<Configure>",
                               lambda e: self.left_canvas.itemconfigure(win, width=e.width))
         self._left_inner = left
@@ -823,6 +1094,49 @@ class App:
                  bg=BG, fg=TXT_DIM, font=(self.font, 8), anchor="w",
                  justify="left").grid(row=3, column=0, columnspan=2, sticky="w", pady=(3, 0))
 
+        # ---- 总线仲裁（半双工 485）----
+        g = group("总线仲裁")
+        g.columnconfigure(1, weight=1)
+        self.bus_wait_var = tk.BooleanVar(value=True)
+        self.bus_window_var = tk.StringVar(value="0")
+        self.bus_maxwait_var = tk.StringVar(value="250")
+        self.bus_retry_var = tk.StringVar(value="0")
+
+        ttk.Checkbutton(g, text="发送前先等总线空闲（等当前帧收完）",
+                        variable=self.bus_wait_var,
+                        command=self._apply_bus_cfg).grid(
+            row=0, column=0, columnspan=4, sticky="w")
+
+        def num_cell(r: int, label: str, var: tk.StringVar, unit: str,
+                     lo: int, hi: int, tip: str = "") -> None:
+            tk.Label(g, text=label, bg=BG, fg=TXT_DIM, font=(self.font, 9)).grid(
+                row=r, column=0, sticky="w", pady=1)
+            sp = ttk.Spinbox(g, textvariable=var, from_=lo, to=hi, increment=1,
+                             width=6, font=(self.font, 9),
+                             command=self._apply_bus_cfg)
+            sp.grid(row=r, column=1, sticky="w", padx=(4, 2))
+            sp.bind("<Return>", lambda e: self._apply_bus_cfg())
+            sp.bind("<FocusOut>", lambda e: self._apply_bus_cfg())
+            tk.Label(g, text=unit, bg=BG, fg=TXT_DIM, font=(self.font, 8)).grid(
+                row=r, column=2, sticky="w")
+            if tip:
+                tk.Label(g, text=tip, bg=BG, fg=TXT_DIM, font=(self.font, 8),
+                         anchor="w").grid(row=r, column=3, sticky="w", padx=(6, 0))
+
+        num_cell(1, "帧后窗口", self.bus_window_var, "ms", 0, 20, "0 = 自动")
+        num_cell(2, "最多等", self.bus_maxwait_var, "ms", 0, 2000)
+        num_cell(3, "无应答重发", self.bus_retry_var, "次", 0, 3)
+
+        self.bus_stat_label = tk.Label(g, text="", bg=BG, fg=TXT_DIM,
+                                       font=(self.font, 8), anchor="w",
+                                       justify="left", wraplength=250)
+        self.bus_stat_label.grid(row=4, column=0, columnspan=4, sticky="ew",
+                                 pady=(3, 0))
+        tk.Label(g, text="MAX13487 是自动方向芯片，主机没法让总线；\n"
+                         "设备推流时只有帧间那 ~1.4 ms 能插话。",
+                 bg=BG, fg=TXT_DIM, font=(self.font, 8), anchor="w",
+                 justify="left").grid(row=5, column=0, columnspan=4, sticky="w")
+
         # ---- 输出设置 ----
         g = group("输出设置")
         g.columnconfigure(1, weight=1)
@@ -943,26 +1257,49 @@ class App:
 
         bar = ttk.Frame(tab)
         bar.grid(row=1, column=0, sticky="ew", pady=(5, 0))
-        tk.Label(bar, text="显示通道", bg=BG, fg=TXT_DIM,
+
+        # 第一行：通道开关
+        r1 = tk.Frame(bar, bg=BG)
+        r1.pack(fill="x")
+        tk.Label(r1, text="显示通道", bg=BG, fg=TXT_DIM,
                  font=(self.font, 9)).pack(side="left")
         self.chan_vars = []
         for i, name in enumerate(AXIS_NAMES):
             v = tk.BooleanVar(value=True)
-            ttk.Checkbutton(bar, text=name, variable=v,
+            ttk.Checkbutton(r1, text=name, variable=v,
                             command=self._on_channel_change).pack(side="left", padx=(6, 0))
             self.chan_vars.append(v)
-        tk.Label(bar, text="时间窗", bg=BG, fg=TXT_DIM,
-                 font=(self.font, 9)).pack(side="left", padx=(16, 0))
-        self.win_var = tk.StringVar(value="5")
-        ttk.Combobox(bar, textvariable=self.win_var, width=5, state="readonly",
-                     values=("1", "2", "5", "10", "20"),
+
+        # 第二行：横轴（时间 / 点数）+ 跨度 + 刷新
+        r2 = tk.Frame(bar, bg=BG)
+        r2.pack(fill="x", pady=(4, 0))
+        tk.Label(r2, text="X 轴", bg=BG, fg=TXT_DIM,
+                 font=(self.font, 9)).pack(side="left")
+        self.xmode_var = tk.StringVar(value=X_MODE_LABELS[0])
+        ttk.Combobox(r2, textvariable=self.xmode_var, width=8, state="readonly",
+                     values=X_MODE_LABELS,
                      font=(self.font, 9)).pack(side="left", padx=(4, 0))
+        self.xmode_var.trace_add("write", lambda *_: self._on_xmode_change())
+
+        tk.Label(r2, text="跨度", bg=BG, fg=TXT_DIM,
+                 font=(self.font, 9)).pack(side="left", padx=(12, 0))
+        self.win_var = tk.StringVar(value="5")
+        self.span_box = ttk.Combobox(r2, textvariable=self.win_var, width=7,
+                                     state="readonly", values=SPAN_SEC_CHOICES,
+                                     font=(self.font, 9))
+        self.span_box.pack(side="left", padx=(4, 0))
         self.win_var.trace_add("write", lambda *_: self._on_window_change())
 
-        tk.Label(bar, text="刷新", bg=BG, fg=TXT_DIM,
+        # 点数模式下顺带告诉操作者「这一屏大约是多少秒」—— 点数是为了对齐
+        # 采样节拍，但人看波形还是习惯有个秒数做参照。
+        self.span_hint = tk.Label(r2, text="", bg=BG, fg=TXT_DIM,
+                                  font=(self.font, 8))
+        self.span_hint.pack(side="left", padx=(6, 0))
+
+        tk.Label(r2, text="刷新", bg=BG, fg=TXT_DIM,
                  font=(self.font, 9)).pack(side="left", padx=(16, 0))
         self.refresh_var = tk.StringVar(value=REFRESH_DEFAULT)
-        ttk.Combobox(bar, textvariable=self.refresh_var, width=5, state="readonly",
+        ttk.Combobox(r2, textvariable=self.refresh_var, width=5, state="readonly",
                      values=REFRESH_CHOICES,
                      font=(self.font, 9)).pack(side="left", padx=(4, 0))
         self.refresh_var.trace_add("write", lambda *_: self._on_refresh_change())
@@ -1082,7 +1419,9 @@ class App:
         """滚轮必须递归绑到左栏里每个子控件 —— Tk 的滚轮事件不会冒泡。"""
         def on_wheel(event):
             if self.left_sb.winfo_ismapped():
-                self.left_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+                step = int(24 * self.scale)          # 一格滚轮 ≈ 一行控件的高度
+                self.left_canvas.yview_scroll(-step if event.delta > 0 else step,
+                                              "units")
             return "break"
 
         def walk(w):
@@ -1091,6 +1430,14 @@ class App:
                 walk(child)
 
         walk(widget)
+
+    def _sync_left_scrollregion(self, _event=None) -> None:
+        """滚动域 = 内框自然尺寸；尺寸没变就什么都不做（移动事件也会进这里）。"""
+        sr = (0, 0, self._left_inner.winfo_reqwidth(),
+              self._left_inner.winfo_reqheight())
+        if sr != self._left_sr:
+            self._left_sr = sr
+            self.left_canvas.configure(scrollregion=sr)
 
     def _update_left_scrollbar(self) -> None:
         """
@@ -1170,7 +1517,8 @@ class App:
     def _conn_settings(self) -> dict:
         mode = self.mode_var.get()
         base = {"order": self.order_var.get(),
-                "stream_every": 50 if self.log_stream_var.get() else 0}
+                "stream_every": 50 if self.log_stream_var.get() else 0,
+                **self._bus_cfg()}
         if mode == MODE_SERIAL:
             port = self._selected_port()
             if not port:
@@ -1189,6 +1537,7 @@ class App:
             tr = TcpTransport(cfg["host"], cfg["port"], timeout=3.0)
         cli = Y75Client(tr, byte_order=cfg["order"])
         cli.log_stream_every = cfg["stream_every"]
+        apply_bus_cfg(cli, cfg)
         cli.on_log = lambda lvl, msg: self.ui_queue.put(("log", lvl, msg, ""))
         cli.on_state = lambda st, d: self.ui_queue.put(("state", st, d, ""))
         cli.on_push = self._on_push_thread
@@ -1204,6 +1553,7 @@ class App:
         self.btn_disconnect.state(["!disabled"])
         self._set_status(f"已连接 {name}")
         self._read_device_info()
+        self._update_bus_stat()
         # --autoconnect：连上后自动进入连续采集（演示 / 自检用）
         if getattr(self.args, "autoconnect", False) and not self._auto_started:
             self._auto_started = True
@@ -1234,6 +1584,7 @@ class App:
             v.configure(text="—")
         self.wave.reset()                  # 时间轴与量程一并清掉
         self._set_status("已断开")
+        self._update_bus_stat()
 
     # ==================================================================
     #  异步执行
@@ -1390,10 +1741,19 @@ class App:
         self._run_async(lambda: self.cli.start(), done, "开始连续采集")
 
     def on_stop(self) -> None:
+        # 设备正在推流时，停止命令不能立刻拍下去 —— 必须等当前这一帧在线上
+        # 走完（MAX13487 自动方向，主机没法让总线，帧中间插话会撞车）。
+        # 真正的等待在协议层 BusGate 里做，这里只负责把状态说清楚。
+        cli = self.cli
+        streaming = cli is not None and cli.bus.enabled and self.send_mode == 1
+        if streaming:
+            self._log_ui("info", "等当前这一帧收完再发停止命令（避开 485 正在发送的时段）…")
+
         def done(_res):
             self.send_mode = 0
             self._log_ui("info", "已停止连续采集")
-        self._run_async(lambda: self.cli.stop(), done, "停止连续采集")
+        self._run_async(lambda: self.cli.stop(), done,
+                        "等帧间空隙后停止" if streaming else "停止连续采集")
 
     def on_single(self) -> None:
         self._run_async(self._do_single, self._apply_single, "单次采集")
@@ -1655,6 +2015,7 @@ class App:
     #  界面刷新
     # ==================================================================
     def _tick(self) -> None:
+        t_start = time.perf_counter()
         try:
             self._drain_queue()
             self._drain_save_buffer()          # 必须在 connected 判断之外
@@ -1669,6 +2030,12 @@ class App:
                     self._update_values()      # 数字降频，免得闪到看不清
                     self._update_stats()
         finally:
+            # 固定周期重排。试过两种花活，实测都更差：
+            #   * 「按绝对时刻补帧」：系统整体拖后几毫秒时立刻补一帧，
+            #     帧间隔在 15~42ms 之间乱跳（变异系数 35%）；
+            #   * 「按本帧耗时扣减」：等待时间短于 17ms 时 Tk 的定时器
+            #     反而会多等一个系统 tick，周期照样漂。
+            # 老老实实固定间隔，帧间隔抖动最小（实测 11%），看着反而最稳。
             self.root.after(self.tick_ms, self._tick)
 
     def _update_values(self) -> None:
@@ -1687,9 +2054,10 @@ class App:
         cli = self.cli
         if cli is None:
             return
-        # 只取可视时间窗内的样本，别每帧都复制整段缓冲。
-        # 多要 1s：时间轴右边界比最新数据晚 LATENCY，左边界会往前多探一点。
-        count, samples = cli.take_wave(self.wave.window_sec + 1.0)
+        w = self.wave
+        # 两种模式都**按个数**取（见 WaveCanvas.want_points 的说明）：按时间戳
+        # 取的话，真机设备时钟一重锚，切片长度就变，横轴位置跟着突跳。
+        count, samples = cli.take_wave(max_points=w.want_points())
         if not samples:
             # 这一 tick 没有新帧（USB 驱动在攒批，或设备短暂停顿）。
             # **千万不要就此不重绘**：时间轴是按本地时钟匀速推进的，
@@ -1700,7 +2068,7 @@ class App:
             samples = self.wave._last_samples
             if not samples:
                 return
-        self.wave.draw(samples)
+        self.wave.draw(samples, count=count)
 
     def _update_stats(self) -> None:
         cli = self.cli
@@ -1728,6 +2096,7 @@ class App:
         # 波形刷新质量：实测 fps + 帧间隔抖动。卡不卡不用吵，和 Modbus 版
         # 摆一起对数字就行（那一版实际只有 ~21fps / 1.2ms 抖动）。
         w = self.wave
+        self._update_span_hint()         # 点数模式下「≈ 多少秒」随实测节拍更新
         if w.fps > 0.5:
             self.stat_labels["wave"].configure(
                 text=f"{w.fps:.0f} fps ±{w.jitter_ms:.1f} ms", fg=TXT)
@@ -1753,6 +2122,7 @@ class App:
             self.stat_labels["batch"].configure(
                 text=f"{ms:.1f} ms / {cli.batch_frames:.0f}帧",
                 fg=(LEVEL_COLOR["warn"] if ms >= 8.0 else TXT))
+        self._update_bus_stat()
 
     def on_diagnose(self) -> None:
         """一键链路体检：把定位「卡」所需的数字一次性打进日志。
@@ -1794,6 +2164,7 @@ class App:
                              f"，丢弃乱码 {cli.garbage_bytes} 字节"
                              f"，空载荷畸形帧 {cli.short_frames}"
                              f"｜波特率 {baud if baud else '—'}")
+        self._log_ui("info", cli.bus.summary())
 
         # ---- 结论 ----
         bad = []
@@ -1812,6 +2183,12 @@ class App:
         if w.fps > 0.5 and fps_set.isdigit() and w.fps < int(fps_set) * 0.7:
             bad.append(f"波形刷新只有 {w.fps:.0f}fps（设定 {fps_set}）："
                        f"瓶颈在本机 CPU / 显示端")
+        if cli.bus.enabled and (cli.bus.timeouts or cli.bus.blind > 3):
+            bad.append(f"总线仲裁有 {cli.bus.blind} 次看不到帧边界、"
+                       f"{cli.bus.timeouts} 次硬超时：串口驱动多半在攒批"
+                       f"（帧被一次性塞过来，看不到「一帧收完」的瞬间），"
+                       f"把 USB 转串口的 Latency Timer 调到 1ms；"
+                       f"或者设备降频到 500Hz 让帧间空隙变大")
         if bad:
             for i, msg in enumerate(bad, 1):
                 self._log_ui("warn", f"体检结论 {i}/{len(bad)}：{msg}")
@@ -1823,17 +2200,119 @@ class App:
         for i, v in enumerate(self.chan_vars):
             self.wave.enabled[i] = bool(v.get())
 
+    def _on_xmode_change(self) -> None:
+        """
+        切换横轴（时间 ↔ 点数）。
+
+        跨度下拉框的候选值和当前值要一起换：时间模式是 1/2/5/10/20 秒，
+        点数模式是 1000~20000 点。不换候选值的话，用户会在点数模式下
+        看到「5 点」这种荒唐的档位。
+        """
+        pts = self.xmode_var.get() == X_MODE_PTS_LABEL
+        self.wave.set_x_mode(WaveCanvas.X_POINTS if pts else WaveCanvas.X_TIME)
+        if pts:
+            self.span_box.configure(values=SPAN_PTS_CHOICES)
+            self.win_var.set(str(self.wave.window_pts))
+            self._log_ui("info", f"横轴改为「点数」：显示最近 {self.wave.window_pts} 个"
+                                 f"采样点（相邻点等间距）")
+        else:
+            self.span_box.configure(values=SPAN_SEC_CHOICES)
+            self.win_var.set(f"{self.wave.window_sec:g}")
+            self._log_ui("info", f"横轴改为「时间」：显示最近 {self.wave.window_sec:g} 秒")
+        self._update_span_hint()
+
     def _on_window_change(self) -> None:
-        try:
-            self.wave.set_window_sec(float(self.win_var.get()))
-        except ValueError:
-            pass
+        """跨度改变：按当前横轴模式解释输入（秒 or 点）。"""
+        txt = self.win_var.get().strip()
+        if self.wave.x_mode == WaveCanvas.X_POINTS:
+            try:
+                self.wave.set_window_pts(int(float(txt)))
+            except (TypeError, ValueError):
+                pass
+            self._update_span_hint()
+        else:
+            try:
+                self.wave.set_window_sec(float(txt))
+            except (TypeError, ValueError):
+                pass
+
+    def _update_span_hint(self) -> None:
+        """点数模式下显示「这一屏约等于多少秒」，用的是实测采样间隔。"""
+        if self.wave.x_mode != WaveCanvas.X_POINTS:
+            if self.span_hint.cget("text"):
+                self.span_hint.configure(text="")
+            return
+        dt = self.wave.dt_est
+        if dt <= 0.0:
+            text = "≈ 采样率未知"
+        else:
+            text = f"≈ {self.wave.window_pts * dt:.1f} s @ {1.0 / dt:.0f} Hz"
+        if text != self.span_hint.cget("text"):
+            self.span_hint.configure(text=text)
 
     def _on_refresh_change(self) -> None:
         """改波形刷新率。下一次 tick 生效，不用重启。"""
         self.tick_ms = refresh_to_ms(self.refresh_var.get())
         self._log_ui("info", f"波形刷新 {self.refresh_var.get()} fps"
                              f"（每 {self.tick_ms}ms 一帧）")
+
+    # ------------------------------------------------------------------
+    #  总线仲裁
+    # ------------------------------------------------------------------
+    def _bus_cfg(self) -> dict:
+        """从界面变量读出一份纯数值配置（只能在主线程调用）。"""
+        def num(var, default: float, lo: float, hi: float) -> float:
+            try:
+                return min(hi, max(lo, float(str(var.get()).strip() or default)))
+            except (TypeError, ValueError):
+                return default
+
+        return {
+            "bus_wait": bool(self.bus_wait_var.get()),
+            "bus_window": num(self.bus_window_var, 0.0, 0.0, 20.0),
+            "bus_maxwait": num(self.bus_maxwait_var, 250.0, 0.0, 2000.0),
+            "bus_retry": int(num(self.bus_retry_var, 0, 0, 3)),
+        }
+
+    def _apply_bus_cfg(self) -> None:
+        """改完立刻作用于当前连接，不用重连。"""
+        cfg = self._bus_cfg()
+        cli = self.cli
+        if cli is not None:
+            apply_bus_cfg(cli, cfg)
+        if not cfg["bus_wait"]:
+            self._log_ui("warn", "总线仲裁已关闭：命令可能落在设备正在发的那一帧里，"
+                                 "485 上会撞车")
+        else:
+            self._log_ui("info", f"总线仲裁：收到一帧后 "
+                                 f"{cfg['bus_window'] or '自动'} ms 内发"
+                                 f"（0 = 按实测帧周期自动），最多等 "
+                                 f"{cfg['bus_maxwait']:.0f} ms，"
+                                 f"无应答重发 {cfg['bus_retry']} 次")
+        self._update_bus_stat()
+
+    def _update_bus_stat(self) -> None:
+        lab = getattr(self, "bus_stat_label", None)
+        if lab is None:
+            return
+        cli = self.cli
+        if cli is None or not self.connected:
+            lab.configure(text="未连接", fg=TXT_DIM)
+            return
+        bus = cli.bus
+        if not bus.enabled:
+            lab.configure(text="关闭中：收到就发（有撞车风险）",
+                          fg=LEVEL_COLOR["warn"])
+            return
+        txt = (f"帧后 {bus.window_s() * 1000:.2f} ms 内发 ｜ 等过 "
+               f"{bus.gate_count} 次，均 {bus.avg_wait_ms():.2f} / "
+               f"最长 {bus.wait_ms_max:.2f} ms")
+        if bus.blind or bus.timeouts:
+            txt += (f"\n⚠ {bus.blind} 次看不到帧边界、{bus.timeouts} 次硬超时"
+                    f"（串口驱动可能在攒批）")
+        lab.configure(text=txt,
+                      fg=(LEVEL_COLOR["warn"] if (bus.blind or bus.timeouts)
+                          else TXT_DIM))
 
     def _update_order_hint(self) -> None:
         self.order_hint.configure(text=f"{ByteOrder.HINT.get(self.order_var.get(), '')}"

@@ -515,6 +515,254 @@ class _Waiter:
 
 
 # =====================================================================
+#  总线仲裁：半双工 485 上的「发言权」
+# =====================================================================
+class BusGate:
+    """
+    判定「现在能不能往 485 总线上发东西」。
+
+    ## 为什么需要它
+
+    MAX13487 是**自动方向**的收发器（没有 DE 引脚可以软件控制），主机没法
+    主动把总线让出来。设备连续推流时总线几乎一直被它占着，只有**帧与帧
+    之间**那一小段是空的：
+
+        460800 波特率下，29 字节数据帧在线上占 29x10/460800 ≈ 0.63 ms；
+        500 Hz 推流时帧周期 2 ms → 每帧之后有约 1.37 ms 空隙；
+        一条 8 字节命令只占 0.17 ms，塞进空隙绰绰有余。
+
+    命令只要落在空隙里就不会撞车。一旦落在设备**正在发的那一帧**中间，
+    两个驱动器同时拉总线 → 双方收到的都是垃圾：设备侧拆帧错乱（严重时
+    进 HardFault），主机侧也等不到 ACK。
+
+    ## 什么时候发：帧刚收完的那一瞬间
+
+    关键的一点（也是老版本做错的地方）：**必须在「刚刚收完一整帧」的那一刻
+    立刻发，而不是先等一小段静默再发**。
+
+    设接收链路延迟为 d（USB 转串口的 Latency Timer、驱动缓冲、线程调度都算
+    在里面）。你在主机上看到「第 N 帧收完」时，总线其实已经走到
+    「第 N 帧结束 + d」。下一帧在线上从「第 N 帧结束 + 1.37ms」开始，
+    也就是说：**从观察到帧结束的那一刻算起，只剩 1.37 - d 毫秒的空隙**。
+
+    - d 很小时（TCP、或 Latency Timer 调到 1ms 的串口）：余量足足有 1ms 上下；
+    - 如果先等 0.8ms 静默再发，等于把这 0.8ms 从余量里白扣掉，
+      d 稍大一点就会正好踩进下一帧 —— 这正是「等静默」策略的致命缺陷，
+      实测撞车率约 30%（用模拟器的 --collide 模式量出来的）。
+
+    所以规则是：**看到一整帧收完（且缓冲里没有半帧）就立刻发**，越早越好。
+    帧后窗口 `window` 只是用来判断「这个帧结束还算不算新鲜」——超过窗口
+    就说明我们已经错过了这段空隙，不如等下一帧。
+
+    ## 放行条件
+
+    1. 距自己上一次发送已经过了 `guard`（默认 2 个帧周期）——
+       别在设备正要回 ACK 的窗口里又插一帧；
+    2. 并且满足下面任一条：
+       a. 最近一帧收完的时刻距今 ≤ `window`，且拆帧缓冲里没有半帧
+          （= 正处在帧间空隙里，这是正常路径）；
+       b. 总线已经静默 `idle_s`（默认 4 个帧周期，至少 4ms）——
+          设备根本没在推流，等下去没有意义，立刻发。
+
+    实在等不到（比如串口驱动在攒批，压根看不到帧边界）就按 `soft_deadline`
+    （3 个帧周期）放行，计入 `blind`；超过 `max_wait_ms` 还没成，计入
+    `timeouts`。两者在界面上都能看到。
+    """
+
+    #: 轮询步长（秒）。比帧后窗口小一截，才抓得住空隙
+    POLL = 0.00015
+    #: 帧后窗口 = 帧周期 x 这个系数（0.35 帧：够覆盖一次轮询抖动，
+    #: 又不至于把余量耗光）
+    WINDOW_K = 0.35
+    WINDOW_MIN = 0.00020         # 0.20 ms 下限
+    WINDOW_MAX = 0.00150         # 1.50 ms 上限
+    #: guard = 帧周期 x 这个系数（2 帧：设备一般下一帧就回 ACK）
+    GUARD_K = 2.0
+    #: 静默多久算「设备没在推流」：4 个帧周期，且不少于 4ms
+    IDLE_K = 4.0
+    IDLE_MIN = 0.004
+
+    def __init__(self):
+        #: 关掉就完全回到「立刻发」的老行为（排查用）
+        self.enabled = True
+        #: 帧后窗口，毫秒；0 = 按实测帧周期自动
+        self.window_ms = 0.0
+        #: 最多等这么久，超时也发，毫秒
+        self.max_wait_ms = 250.0
+        #: 发送后的自我保护窗口，毫秒；0 = 自动
+        self.guard_ms = 0.0
+        #: 实测帧周期（秒），由客户端同步进来
+        self.sample_dt = 1.0 / 500.0
+
+        self._last_rx = 0.0          # 最近一次收到字节的时刻（time.time）
+        self._last_frame = 0.0       # 最近一帧完整收完的时刻（任何帧）
+        self._last_data = 0.0        # 最近一个**数据帧**收完的时刻
+        self._last_tx = 0.0          # 自己上一次发完的时刻
+        #: 收完一整帧就 +1 并 set —— 让等总线的一方**立刻**被唤醒，
+        #: 而不是睡到下一个轮询点（轮询的 0.15ms 抖动足以吃掉帧间余量）
+        self._frame_seq = 0
+        self._frame_ev = threading.Event()
+
+        # ---- 统计（界面显示用）----
+        self.gate_count = 0          # 被拦下来等过的次数
+        self.wait_ms_sum = 0.0
+        self.wait_ms_max = 0.0
+        self.wait_ms_last = 0.0
+        self.timeouts = 0            # 等到硬超时也没等到空隙的次数
+        self.blind = 0               # 看不到帧边界、等够 3 帧就发的次数
+
+    # ------------------------------------------------------------------
+    #  接收线程上报
+    # ------------------------------------------------------------------
+    def note_rx(self, t: Optional[float] = None) -> None:
+        self._last_rx = time.time() if t is None else t
+
+    def note_frame(self, t: Optional[float] = None, data: bool = False) -> None:
+        """
+        收完一整帧。
+
+        data=True 表示这是**数据帧**（0x02 推流 / 0x03 单次应答）。
+        只有数据帧才被当作「总线进入空隙」的可靠信号：
+
+        设备推流是周期性的（500Hz 每 2ms 一帧、帧本身占 0.63ms），所以每个
+        数据帧后面必然跟着 1.37ms 的空隙。而 ACK / 状态回复是主循环里插空
+        发出来的，它前面后面都没有固定节拍 —— ACK 收完的下一微秒就可能正好
+        接上一个推流帧。把 ACK 当成「可以发」的信号，就是撞车的来源。
+        """
+        now = time.time() if t is None else t
+        self._last_frame = now
+        self._last_rx = now
+        if not data:
+            return
+        self._last_data = now
+        self._frame_seq += 1
+        self._frame_ev.set()         # 唤醒正在等「帧间空隙」的发送方
+
+    def note_tx(self, t: Optional[float] = None) -> None:
+        self._last_tx = time.time() if t is None else t
+
+    def reset(self) -> None:
+        self._last_rx = self._last_frame = self._last_data = self._last_tx = 0.0
+        self._frame_ev.clear()
+        self.gate_count = 0
+        self.wait_ms_sum = self.wait_ms_max = self.wait_ms_last = 0.0
+        self.timeouts = 0
+        self.blind = 0
+
+    # ------------------------------------------------------------------
+    def _dt(self) -> float:
+        return max(self.sample_dt, 1e-5)
+
+    def window_s(self) -> float:
+        if self.window_ms > 0.0:
+            return self.window_ms / 1000.0
+        return min(self.WINDOW_MAX, max(self.WINDOW_MIN, self.WINDOW_K * self._dt()))
+
+    def guard_s(self) -> float:
+        if self.guard_ms > 0.0:
+            return self.guard_ms / 1000.0
+        return min(0.050, max(0.0015, self.GUARD_K * self._dt()))
+
+    def idle_s(self) -> float:
+        return max(self.IDLE_MIN, self.IDLE_K * self._dt())
+
+    def soft_deadline_s(self) -> float:
+        """等不到帧边界时的「认了」时长：3 个帧周期。"""
+        return max(0.004, 3.0 * self._dt())
+
+    def busy_now(self, is_partial: bool) -> bool:
+        """此刻总线是否「不该发」。给界面做提示用。"""
+        now = time.time()
+        rx_gap = (now - self._last_rx) if self._last_rx > 0.0 else 1e9
+        if rx_gap >= self.idle_s():
+            return False
+        since_frame = (now - self._last_frame) if self._last_frame > 0.0 else 1e9
+        return bool(is_partial) or since_frame > self.window_s()
+
+    # ------------------------------------------------------------------
+    def wait_idle(self, is_partial: Any, now: Optional[float] = None) -> float:
+        """
+        阻塞到「可以发」为止，返回**等了多久（毫秒）**。关掉时立刻返回 0。
+
+        is_partial：无参可调用对象，返回 True 表示拆帧缓冲里还有半帧
+                    （只能由客户端提供，因为缓冲在它手里）。
+
+        等待分两段：
+          1. 先等够 guard（自己上一次发言后的保护期，别踩到设备正在回的 ACK）；
+          2. 再等**下一个**帧边界 —— 收包线程一旦收完整帧就 set 事件，
+             这里立刻返回，所以「帧收完 → 真正 write」只差一次线程唤醒
+             （几十微秒），帧间余量不会被轮询抖动吃掉。
+        """
+        if not self.enabled:
+            return 0.0
+        t0 = time.time() if now is None else now
+        hard = t0 + max(0.0, self.max_wait_ms) / 1000.0
+        soft = t0 + self.soft_deadline_s()
+        guard = self.guard_s()
+        idle = self.idle_s()
+        window = self.window_s()
+        seq = self._frame_seq
+        gave_up = 0                     # 0 = 正常等到，1 = 软超时，2 = 硬超时
+
+        while True:
+            t = time.time()
+            rx_gap = (t - self._last_rx) if self._last_rx > 0.0 else 1e9
+            tx_gap = (t - self._last_tx) if self._last_tx > 0.0 else 1e9
+
+            if tx_gap >= guard:
+                since_data = ((t - self._last_data)
+                              if self._last_data > 0.0 else 1e9)
+                if since_data >= idle and rx_gap >= idle:
+                    # 设备没在推流：总线上没有周期性的数据帧，不必等边界
+                    break
+                if self._frame_seq != seq:
+                    # 边界还必须**新鲜**：如果刚才在等 guard，等到 guard 到期
+                    # 时手上这个边界可能已经是 1ms 前的旧事了，那时候空隙
+                    # 早走完了，照着旧边界拍下去正好压在下一帧的起点上。
+                    stale = (t - self._last_data) > window
+                    if not is_partial() and not stale:
+                        break           # 干净的一帧刚收完 —— 就是现在
+                    seq = self._frame_seq     # 旧边界 / 半帧边界都不算，等下一个
+
+            if t >= hard:
+                gave_up = 2
+                break
+            if t >= soft:
+                gave_up = 1
+                break
+            self._frame_ev.wait(0.0005)
+            self._frame_ev.clear()
+
+        waited = (time.time() - t0) * 1000.0
+        self.wait_ms_last = waited
+        if gave_up == 2:
+            self.timeouts += 1
+        elif gave_up == 1:
+            self.blind += 1
+        if waited >= 0.2:                     # 有意义的等待才计入统计
+            self.gate_count += 1
+            self.wait_ms_sum += waited
+            self.wait_ms_max = max(self.wait_ms_max, waited)
+        return waited
+
+    # ------------------------------------------------------------------
+    def avg_wait_ms(self) -> float:
+        return self.wait_ms_sum / self.gate_count if self.gate_count else 0.0
+
+    def summary(self) -> str:
+        if not self.enabled:
+            return "总线仲裁：关闭（收到就发）"
+        s = (f"总线仲裁：帧后 {self.window_s() * 1000:.2f} ms 内发，"
+             f"等过 {self.gate_count} 次 / 均 {self.avg_wait_ms():.2f} ms / "
+             f"最长 {self.wait_ms_max:.2f} ms")
+        if self.blind:
+            s += f" / 看不到帧边界 {self.blind} 次"
+        if self.timeouts:
+            s += f" / 硬超时 {self.timeouts} 次"
+        return s
+
+
+# =====================================================================
 #  客户端
 # =====================================================================
 class Y75Client:
@@ -542,6 +790,12 @@ class Y75Client:
     #: 同类告警日志的最小间隔（秒）。畸形帧/干扰可能每秒几百个，
     #: 逐条记日志会把界面的文本控件刷爆（实测帧率掉三分之一）。
     LOG_GATE_SEC = 1.0
+    #: 设备时钟（等间隔推算）允许超前本机时间多少秒。
+    #: USB 驱动一次交上来 8~16ms 的一批帧，批内每帧都 +sample_dt，所以
+    #: 时钟短暂超前本机时间是**正常**的，容差要盖住一批的最大跨度。
+    #: 但超过这个量就说明 sample_dt 被高估了（典型：统计窗跨了
+    #: 「停止→开始」的空洞，量出几倍于真实帧周期的假节拍），必须拉回。
+    TS_AHEAD = 0.08
 
     def __init__(self, transport: Transport, byte_order: str = ByteOrder.DEFAULT,
                  log_raw: bool = True):
@@ -555,6 +809,15 @@ class Y75Client:
         self._stop = threading.Event()
         self._reader: Optional[threading.Thread] = None
         self._cmd_lock = threading.RLock()
+        #: 真正往总线写字节的那一段：总线仲裁 + write，独立于命令锁。
+        #: 加锁顺序恒为 _cmd_lock → _bus_lock，不会反过来。
+        self._bus_lock = threading.Lock()
+        #: 半双工总线的时间窗判定器（见 BusGate）
+        self.bus = BusGate()
+        #: 无应答时自动重发几次。0 = 不重发（默认）。
+        #: 协议没有事务号，重发存在「把上一次的迟到响应认成这一次」的风险，
+        #: 所以默认关掉；只在「命令丢了、总线又确实空」时人工调大更稳。
+        self.bus_retry = 0
         self._waiter: Optional[_Waiter] = None
         self._text_buf = bytearray()
         self._last_rx = 0.0
@@ -627,6 +890,8 @@ class Y75Client:
         self._batch_t0 = 0.0
         self.sample_dt = self._nominal_dt  # 实测节拍也重置，重连后重新量
         self.meas_dt = 0.0
+        self.bus.reset()                   # 总线时间窗重锚，别拿上次的陈旧时刻判断
+        self.bus.sample_dt = self.sample_dt
         self._rate_t0 = 0.0
         self._rate_n0 = 0
         self._log_gate.clear()
@@ -665,6 +930,7 @@ class Y75Client:
 
             if data:
                 self._last_rx = time.time()
+                self.bus.note_rx(self._last_rx)      # 总线仲裁：有线上的字节在动
                 # ---- 攒批体检：一次 recv 拿到多少、隔多久拿到一次 ----
                 t = self._last_rx
                 self.rx_batches += 1
@@ -778,6 +1044,11 @@ class Y75Client:
         self._serve(("text", None), text=raw)
 
     def _handle_frame(self, frame: Frame) -> None:
+        # 只有数据帧才算「总线进入空隙」的可靠信号（见 BusGate.note_frame）。
+        # 时间戳必须用**收包时刻**（recv 返回的那一瞬），不能用现在：
+        # 拆帧、回调、日志都在收包线程里做，等这一帧解析完可能已经过去 1ms，
+        # 拿解析时刻当「帧结束时刻」会让仲裁以为自己离帧边界还很近。
+        self.bus.note_frame(t=self._last_rx, data=(frame.kind == "data"))
         if self.log_raw and frame.kind != "data":
             self._log("rx", f"← {hexs(frame.raw)}   [{frame_text(frame.cmd)}]")
 
@@ -810,6 +1081,18 @@ class Y75Client:
                     self._dev_t = now                  # 首帧 / 断流太久 / 频率档对不上
                 else:
                     self._dev_t += self.sample_dt
+                    if self._dev_t > now + self.TS_AHEAD:
+                        # 等间隔推算跑到了本机时间前面。只要超前量在 TS_AHEAD
+                        # 以内，这是「一批帧同时到达」的正常现象（批内每帧都
+                        # +sample_dt，本机时间还没跟上），不必管。
+                        # 但越过 TS_AHEAD 就意味着 sample_dt 被高估了 —— 常见于
+                        # 统计窗跨过「停止→开始」的空洞（那 0.5s 里只有重启后
+                        # 的几十帧，算出来的帧周期大好几倍）。一旦时钟超前，
+                        # 下面那条「单调兜底」会一直在未来的时间位上继续累加，
+                        # 越加越远：实测点两次停止/开始就能超前 5s，波形上只剩
+                        # 左边一小截（最新数据全在可视窗右边界之外）。
+                        # 所以这里硬拉回本机时间，让推算重新对齐。
+                        self._dev_t = now
                 ts = self._dev_t
                 self.stream_count += 1
             else:
@@ -819,6 +1102,12 @@ class Y75Client:
                 # 时间戳必须严格递增（bisect 依赖）。兜底也保持等间隔——
                 # 老版本的 +1e-6 会把点画成竖条。
                 ts = self.wave[-1][0] + self.sample_dt
+                if ts > now + self.TS_AHEAD:
+                    # 缓冲尾部已经在未来（时钟基准坏过一次）：这里只保证单调，
+                    # 用很小的步长挤过去，让本机时间自己追上来。否则每帧都按
+                    # 整拍往前推，超前的雪球会越滚越大。
+                    ts = self.wave[-1][0] + self.sample_dt * 0.05
+                    self._dev_t = now
             self.latest = vals
             self.push_count += 1
             if frame.cmd == CMD_START:
@@ -855,6 +1144,22 @@ class Y75Client:
         w.ev.set()
 
     # ------------------------------------------------------------------
+    #  发送（所有出站字节都必须走这里）
+    # ------------------------------------------------------------------
+    def _bus_write(self, data: bytes) -> float:
+        """
+        等总线空闲再写下去，返回等待时间（毫秒）。
+
+        这是**唯一的出站入口**。绕过去直接 transport.write() 就等于放弃了
+        半双工仲裁 —— 设备正在发推流帧时插一帧进去，两边都会收到垃圾。
+        """
+        with self._bus_lock:
+            waited = self.bus.wait_idle(lambda: self._asm.pending() > 0)
+            self.transport.write(data)
+            self.bus.note_tx()
+        return waited
+
+    # ------------------------------------------------------------------
     #  请求 / 响应
     # ------------------------------------------------------------------
     def _transact(self, cmd: int, expect_kind: str, payload: bytes = b"",
@@ -864,28 +1169,73 @@ class Y75Client:
             raise Y75Error("设备未连接")
         key = ("text", None) if want_text else \
             (expect_kind, resp_cmd if resp_cmd is not None else (cmd | RESP_FLAG))
+        attempts = 1 + max(0, int(self.bus_retry))
         with self._cmd_lock:
-            w = _Waiter(key)
-            self._waiter = w
-            try:
-                req = build_cmd(cmd, payload)
-                self._log("tx", f"→ {hexs(req)}   [{frame_text(cmd)}]")
-                self.transport.write(req)
-                if not w.ev.wait(timeout):
-                    self.cmd_errors += 1
-                    raise Y75Timeout(f"{frame_text(cmd)}：等待响应超时（{timeout:g}s）")
-            finally:
-                self._waiter = None
-            return w.frame
+            for attempt in range(attempts):
+                frame, ok = self._transact_once(cmd, key, payload, timeout)
+                if ok:
+                    return frame
+                self.cmd_errors += 1
+                if attempt + 1 < attempts:
+                    self._log("warn",
+                              f"{frame_text(cmd)} 无应答，等够帧间空隙后重发"
+                              f"（第 {attempt + 1}/{attempts - 1} 次）")
+                    continue
+                raise Y75Timeout(f"{frame_text(cmd)}：等待响应超时（{timeout:g}s）")
+        return None
+
+    def _transact_once(self, cmd: int, key: Tuple[str, object], payload: bytes,
+                       timeout: float) -> Tuple[Optional[Frame], bool]:
+        """发一帧并等指定应答，返回 (帧, 是否收到)。不等重发，由调用方决定。"""
+        w = _Waiter(key)
+        self._waiter = w
+        try:
+            req = build_cmd(cmd, payload)
+            self._log("tx", f"→ {hexs(req)}   [{frame_text(cmd)}]")
+            waited = self._bus_write(req)
+            if waited >= 0.5:
+                self._log("tx", f"   等总线空闲 {waited:.2f} ms 才发出"
+                                 f"（避开设备正在发的那一帧）")
+            ok = w.ev.wait(timeout)      # 必须先等，再取 frame（frame 是等待中途填的）
+            return w.frame, ok
+        finally:
+            self._waiter = None
 
     # ------------------------------------------------------------------
     #  具体命令
     # ------------------------------------------------------------------
     def stop(self) -> None:
-        self._transact(CMD_STOP, "ack", timeout=1.0)
+        try:
+            self._transact(CMD_STOP, "ack", timeout=1.0)
+        finally:
+            # 超时也一样要重锚：命令可能已经到了设备，流真的停了
+            self._break_stream_clock()
 
     def start(self) -> None:
-        self._transact(CMD_START, "ack", timeout=1.0)
+        try:
+            self._transact(CMD_START, "ack", timeout=1.0)
+        finally:
+            self._break_stream_clock()
+
+    def _break_stream_clock(self) -> None:
+        """
+        起停推流 = 时间轴断档，把「设备时钟」和「节拍统计窗」都重锚。
+
+        设备时钟是「上一帧的时间 + sample_dt」推算出来的，中间停了几百
+        毫秒到几秒：这段时间既没有帧，也没有节拍样本，会同时坏两件事。
+
+        1. `_dev_t` 停在断流那一刻。重启后第一帧只有差值 >0.4s 才重锚，
+           差值小于它就一路带着这个滞后往前走 —— 波形右端永远缺一截，
+           看起来就是「只显示一半」。
+        2. `_rate_t0/_rate_n0` 横跨空洞。0.5s 统计窗里只剩重启后的几十帧，
+           量出来的帧周期是真实值的几倍，`sample_dt` 被高估；而它正是
+           等间隔推算的步长，于是时间戳一路冲进未来，可视窗里只剩旧数据。
+
+        清掉这两样，下一帧会立刻按本机时间重新对钟、重新起统计窗。
+        """
+        self._dev_t = 0.0
+        self._rate_t0 = 0.0
+        self._rate_n0 = self.push_count
 
     def single(self, timeout: float = 1.0) -> Tuple[Optional[float], ...]:
         """单次采集：设备直接回一帧 cmd=0x03 的数据，没有 ACK。"""
@@ -893,12 +1243,17 @@ class Y75Client:
             raise Y75Error("设备未连接")
         base = self.push_count
         with self._cmd_lock:
-            w = _Waiter(("data", CMD_SINGLE))
-            self._waiter = w
-            self._log("tx", f"→ {hexs(build_cmd(CMD_SINGLE))}   [单次采集]")
-            self.transport.write(build_cmd(CMD_SINGLE))
-            got = w.ev.wait(timeout)
-            self._waiter = None
+            self._waiter = w = _Waiter(("data", CMD_SINGLE))
+            try:
+                req = build_cmd(CMD_SINGLE)
+                self._log("tx", f"→ {hexs(req)}   [单次采集]")
+                waited = self._bus_write(req)
+                if waited >= 0.5:
+                    self._log("tx", f"   等总线空闲 {waited:.2f} ms 才发出"
+                                     f"（避开设备正在发的那一帧）")
+                got = w.ev.wait(timeout)
+            finally:
+                self._waiter = None
         if not got:
             if self.push_count != base:
                 return self.latest    # 设备正在推流，拿到的也是刚采的值
@@ -935,6 +1290,8 @@ class Y75Client:
         self.sample_dt = self._nominal_dt
         self.meas_dt = 0.0                 # 换档后重新实测
         self._rate_t0 = 0.0
+        self._dev_t = 0.0                  # 换档也等于一次断档，设备时钟重锚
+        self.bus.sample_dt = self.sample_dt
 
     def _tune_rate(self, now: float) -> None:
         """
@@ -956,12 +1313,18 @@ class Y75Client:
         self._rate_t0, self._rate_n0 = now, self.push_count
         if n < 25 or span <= 0.0:
             return
+        if span > 2.0:
+            # 这一窗横跨了断流（暂停/重连/切到单次采集）：期间没有帧，
+            # 拿 span/n 算出来的只是「空洞 + 一小段推流」的平均，不是节拍。
+            # 信了它，sample_dt 会被放大好几倍，时间戳跟着冲进未来。
+            return
         meas = span / n                                    # 实测帧周期
         if not 0.0005 <= meas <= 0.05:                     # 20Hz ~ 2kHz 之外不采信
             return
         self.meas_dt = (meas if self.meas_dt <= 0.0
                         else self.meas_dt * 0.7 + meas * 0.3)
         self.sample_dt = self.meas_dt
+        self.bus.sample_dt = self.sample_dt    # 帧间空隙的判定跟着实测节拍走
 
     def set_baud(self, baud: int) -> int:
         """下发新波特率，返回波特率码。调用方收到 ACK 后需自行切换串口参数。"""
@@ -1005,35 +1368,49 @@ class Y75Client:
 
     def query_matrix(self, timeout: float = 2.0) -> List[List[float]]:
         """读取 6×6 解耦矩阵。设备回 6 行裸 ASCII。"""
-        while self.text_log:
-            self.text_log.pop()
-        self._text_buf.clear()
-        req = build_cmd(CMD_QUERY_MATRIX)
-        with self._cmd_lock:
-            self._log("tx", f"→ {hexs(req)}   [查询矩阵]")
-            self.transport.write(req)
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if parse_matrix_text("\n".join(self.text_log)) is not None:
-                break
-            time.sleep(0.03)
-        mat = parse_matrix_text("\n".join(self.text_log))
-        if mat is None:
-            raise Y75Error("矩阵回复解析失败，收到的文本：" +
-                           " | ".join(t.strip().replace("\r", "") for t in self.text_log))
-        return mat
+        attempts = 1 + max(0, int(self.bus_retry))
+        last_text: List[str] = []
+        for attempt in range(attempts):
+            while self.text_log:
+                self.text_log.pop()
+            self._text_buf.clear()
+            req = build_cmd(CMD_QUERY_MATRIX)
+            with self._cmd_lock:
+                self._log("tx", f"→ {hexs(req)}   [查询矩阵]")
+                waited = self._bus_write(req)
+                if waited >= 0.5:
+                    self._log("tx", f"   等总线空闲 {waited:.2f} ms 才发出"
+                                     f"（避开设备正在发的那一帧）")
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                if parse_matrix_text("\n".join(self.text_log)) is not None:
+                    break
+                time.sleep(0.03)
+            mat = parse_matrix_text("\n".join(self.text_log))
+            if mat is not None:
+                return mat
+            last_text = list(self.text_log)
+            if attempt + 1 < attempts:
+                self._log("warn", "矩阵回复没解析出来，等够帧间空隙后重试一次")
+        raise Y75Error("矩阵回复解析失败，收到的文本：" +
+                       " | ".join(t.strip().replace("\r", "") for t in last_text))
 
     def send_raw(self, data: bytes, note: str = "手动发送") -> None:
         """直接把一串字节写下去（「自定义报文」用）。"""
         if not self.is_connected():
             raise Y75Error("设备未连接")
-        self._log("tx", f"→ {hexs(data)}   [{note}]")
-        self.transport.write(data)
+        with self._cmd_lock:        # 别插进别人的「发一条等一条」中间
+            self._log("tx", f"→ {hexs(data)}   [{note}]")
+            waited = self._bus_write(data)
+            if waited >= 0.5:
+                self._log("tx", f"   等总线空闲 {waited:.2f} ms 才发出"
+                                 f"（避开设备正在发的那一帧）")
 
     # ------------------------------------------------------------------
     #  波形辅助
     # ------------------------------------------------------------------
-    def take_wave(self, window_sec: Optional[float] = None
+    def take_wave(self, window_sec: Optional[float] = None,
+                  max_points: int = 0
                   ) -> Tuple[int, List[Tuple[float, Tuple[float, ...]]]]:
         """
         取波形快照，返回 (push_count, 样本列表)。
@@ -1041,6 +1418,8 @@ class Y75Client:
         界面拿计数判断「这次有没有新数据」，没变就不用重绘。
 
         window_sec 不为空时，只返回「最新样点往前 window_sec 秒」这一段。
+        max_points 不为 0 时改按**个数**取最近这么多个点（点数横轴用）。
+
         波形缓冲是 20s × 1000Hz = 2 万帧，如果每帧都把整段复制一遍，
         白白花掉大量时间在复制不可见的旧数据上 —— 这也是波形发卡的一个来源。
         """
@@ -1051,6 +1430,10 @@ class Y75Client:
         wave = self.wave
         if not wave:
             return n, []
+        if max_points and max_points > 0:
+            # 按点数取：切片只复制引用，2 万个元素也不到 0.2ms
+            return n, (wave[-max_points:] if len(wave) > max_points
+                       else list(wave))
         if window_sec and window_sec > 0:
             t0 = wave[-1][0] - window_sec
             return n, wave[bisect_left(wave, (t0,)):]

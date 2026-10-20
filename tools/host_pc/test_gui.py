@@ -31,7 +31,9 @@ sys.path.insert(0, HERE)
 import tkinter as tk                                            # noqa: E402
 from argparse import Namespace                                  # noqa: E402
 
-from y75_app import MODE_TCP, OUT_ASC, OUT_HEX, App             # noqa: E402
+from y75_app import (MODE_TCP, OUT_ASC, OUT_HEX, SPAN_PTS_CHOICES,  # noqa: E402
+                     SPAN_SEC_CHOICES, X_MODE_PTS_LABEL, X_MODE_TIME_LABEL,
+                     App, WaveCanvas)
 from y75_protocol import AXIS_NAMES                             # noqa: E402
 
 PASS = FAIL = 0
@@ -146,6 +148,52 @@ def test_stream(root: tk.Tk, app: App) -> None:
     for v in app.chan_vars:
         v.set(True)
     app._on_channel_change()
+
+
+def test_bus_panel(root: tk.Tk, app: App) -> None:
+    section("2b. 总线仲裁面板")
+    check("默认开启「发送前先等总线空闲」", bool(app.bus_wait_var.get()))
+    check("默认帧后窗口 = 0（自动）", app.bus_window_var.get().strip() == "0")
+    check("默认最多等 250ms", app.bus_maxwait_var.get().strip() == "250")
+    check("默认不重发（协议无事务号，重发有认错响应的风险）",
+          app.bus_retry_var.get().strip() == "0")
+
+    cli = app.cli
+    assert cli is not None
+    check("仲裁对象已挂到客户端且默认启用", cli.bus.enabled)
+
+    # 改数字 → 立刻作用到当前连接
+    app.bus_window_var.set("1.5")
+    app.bus_maxwait_var.set("120")
+    app.bus_retry_var.set("2")
+    app._apply_bus_cfg()
+    check("帧后窗口改动立刻生效", abs(cli.bus.window_ms - 1.5) < 1e-6,
+          f"{cli.bus.window_ms}")
+    check("最多等改动立刻生效", abs(cli.bus.max_wait_ms - 120.0) < 1e-6,
+          f"{cli.bus.max_wait_ms}")
+    check("重发次数改动立刻生效", cli.bus_retry == 2, str(cli.bus_retry))
+
+    # 非法输入回落默认，不能让界面炸
+    app.bus_window_var.set("abc")
+    app.bus_maxwait_var.set("")
+    app.bus_retry_var.set("99")
+    cfg = app._bus_cfg()
+    check("非法输入回落到默认值", cfg["bus_window"] == 0.0 and cfg["bus_maxwait"] == 250.0,
+          str(cfg))
+    check("重发次数被夹到 3 以内", cfg["bus_retry"] == 3, str(cfg["bus_retry"]))
+
+    # 关掉开关 → cli.bus.enabled 跟着关
+    app.bus_wait_var.set(False)
+    app._apply_bus_cfg()
+    check("关掉开关后客户端真的不再仲裁", not cli.bus.enabled)
+    app.bus_wait_var.set(True)
+    app.bus_window_var.set("0")
+    app.bus_maxwait_var.set("250")
+    app.bus_retry_var.set("0")
+    app._apply_bus_cfg()
+    check("恢复默认后仲裁重新启用", cli.bus.enabled and cli.bus_retry == 0)
+    check("状态行能显示仲裁统计", "帧后" in app.bus_stat_label.cget("text"),
+          app.bus_stat_label.cget("text").replace("\n", " / "))
 
 
 def test_single_and_settings(root: tk.Tk, app: App) -> None:
@@ -342,6 +390,26 @@ def test_layout(root: tk.Tk, app: App) -> None:
           app.left_canvas.yview()[1] >= 0.999 or content_h <= view_h,
           f"yview {before} → {app.left_canvas.yview()}")
 
+    # 滚动域只能由内容尺寸决定。老实现拿 bbox("all")，把**已移动**的内框位置
+    # 算了进去：每拖一格滚动条滚动域就缩一截（实测 1628→862），一次鼠标事件里
+    # 窗口被搬好几回 → 卡顿 + Windows 重影，而且 yview 比例到 1 了内容还差半屏。
+    sr0 = app.left_canvas.cget("scrollregion")
+    app.left_canvas.yview_moveto(0.5)
+    root.update()
+    sr1 = app.left_canvas.cget("scrollregion")
+    app.left_canvas.yview_moveto(1.0)
+    root.update()
+    sr2 = app.left_canvas.cget("scrollregion")
+    check("滚动域不随滚动漂移（老实现 1628 → 862 越滚越缩）",
+          sr0 == sr1 == sr2, f"{sr0} → {sr1} → {sr2}")
+    drop = content_h - view_h
+    check("滚到底时内容偏移等于 内容高-视口高（真底部够得着）",
+          abs(app._left_inner.winfo_y() + drop) <= 2,
+          f"inner.y {app._left_inner.winfo_y()}，期望 {-drop}")
+    check("滚动域高度就是内容高度",
+          abs(float(str(sr2).split()[-1]) - content_h) <= 2,
+          f"scrollregion {sr2} vs 内容 {content_h}")
+
     # 反向：窗口拉到足够高 → 滚动条应当收起（不占位）
     root.geometry(f"{int(1080 * app.scale)}x{int(1500 * app.scale)}")
     root.update()
@@ -432,7 +500,7 @@ def test_wave_decoupled(root: tk.Tk, app: App) -> None:
             self.push_count = 0
             self.calls = 0
 
-        def take_wave(self, window_sec=None):
+        def take_wave(self, window_sec=None, max_points=0):
             self.calls += 1
             if self.calls == 1:
                 self.push_count += 5
@@ -448,7 +516,7 @@ def test_wave_decoupled(root: tk.Tk, app: App) -> None:
     fake = FakeCli()
     app.cli = fake                              # type: ignore[assignment]
     app.wave._last_samples = [(100.0, (0.1, 0.0, 0.0, 0.0, 0.0, 0.0))]
-    app.wave.draw = lambda samples, force=False: drawn.append(len(samples))
+    app.wave.draw = lambda samples, force=False, count=None: drawn.append(len(samples))
     try:
         for _ in range(5):
             app._update_wave()
@@ -464,6 +532,278 @@ def test_wave_decoupled(root: tk.Tk, app: App) -> None:
         app.wave.draw = real_draw
         app.wave._last_samples = saved_samples
         app.wave.reset(replot=True)
+
+
+def test_points_axis(root: tk.Tk, app: App) -> None:
+    """
+    横轴可切「时间 ↔ 点数」，点数模式下：
+
+    1. 横坐标按**采样点序号**定位 —— 相邻点等间距（这是点数轴的意义所在：
+       数一个周期占几个点、两帧之间隔几个点，不能因为节拍抖动而伸缩）；
+    2. 一屏正好是设定的点数（1000~20000），右端贴住最新一点；
+    3. 抽稀后仍然等间距，不会因为抽稀把点挤到一边。
+    """
+    section("8. 横轴：时间 ↔ 点数")
+    w = app.wave
+    check("默认横轴是时间", w.x_mode == WaveCanvas.X_TIME, w.x_mode)
+    check("默认跨度候选项是秒", tuple(app.span_box.cget("values")) == SPAN_SEC_CHOICES,
+          str(app.span_box.cget("values")))
+
+    t0 = time.time() - 8.0
+    dt = 0.002                                    # 模拟 500Hz
+    def make(n: int):
+        return [(t0 + i * dt, (float(i % 100), 0.5, -0.5, 0.0, 1.0, -1.0))
+                for i in range(n)]
+
+    w.draw(make(3000), force=True)
+    check("时间模式刻度带单位 s",
+          w.itemcget(w._items["xlab"][0], "text").endswith("s"),
+          w.itemcget(w._items["xlab"][0], "text"))
+
+    # ---- 切到点数 ----
+    app.xmode_var.set(X_MODE_PTS_LABEL)
+    app._on_xmode_change()
+    check("切到点数模式", w.x_mode == WaveCanvas.X_POINTS, w.x_mode)
+    check("点数模式默认 2000 点", w.window_pts == 2000, str(w.window_pts))
+    check("跨度候选项换成点数", tuple(app.span_box.cget("values")) == SPAN_PTS_CHOICES,
+          str(app.span_box.cget("values")))
+    check("跨度输入框同步成当前点数", app.win_var.get().strip() == "2000",
+          app.win_var.get())
+
+    w.draw(make(3000), force=True)
+    xl = [w.itemcget(it, "text") for it in w._items["xlab"]]
+    check("点数模式刻度是整数且左端为 -2000", xl[0] == "-2000" and xl[-1] == "0", str(xl))
+    check("点数模式刻度不带 s", not any("s" in s for s in xl), str(xl))
+
+    # ---- 一屏正好 N 点、等间距、贴住最新一点 ----
+    w.set_window_pts(1000)
+    w.draw(make(3000), force=True)
+    co = w.coords(w._items["curve"][0])
+    xs = co[0::2]
+    pw = w.winfo_width() - w.PAD_L - w.PAD_R
+    gaps = [b - a for a, b in zip(xs, xs[1:])]
+    check("一屏点数等于设定值（1000 点铺满宽度，一个不丢）",
+          len(xs) == 1000, f"画了 {len(xs)} 个点，设定 1000 点")
+    check("相邻点等间距（不因节拍抖动伸缩）",
+          max(gaps) - min(gaps) < 0.01, f"间距 {min(gaps):.3f}~{max(gaps):.3f}px")
+    check("右端贴住最新一点（不留空白、也不越界）",
+          abs(xs[-1] - (w.PAD_L + pw)) <= 1.5,
+          f"末点 x={xs[-1]:.1f}，右轴 x={w.PAD_L + pw:.1f}")
+
+    # ---- 20000 点也要能画（缓冲上限）----
+    w.set_window_pts(20000)
+    big = make(20000)
+    t = time.perf_counter()
+    w.draw(big, force=True)
+    cost = (time.perf_counter() - t) * 1000.0
+    co = w.coords(w._items["curve"][0])
+    check("20000 点抽稀后仍然有点可画", len(co) >= 40, f"{len(co) // 2} 点")
+    check("20000 点的重绘仍然够快（≤40ms，否则掉帧）", cost <= 40.0, f"{cost:.1f} ms")
+    check("20000 点的刻度左端是 -20000",
+          w.itemcget(w._items["xlab"][0], "text") == "-20000",
+          w.itemcget(w._items["xlab"][0], "text"))
+    check("点数模式的秒数换算提示", "s @" in app.span_hint.cget("text"),
+          app.span_hint.cget("text"))
+    check("跨度换算 = 点数 × 实测采样间隔",
+          abs(w.span_sec() - w.window_pts * w.dt_est) < 1e-6,
+          f"{w.span_sec():.2f}s = {w.window_pts} × {w.dt_est * 1000:.2f}ms")
+
+    # ---- 切回时间 ----
+    app.xmode_var.set(X_MODE_TIME_LABEL)
+    app._on_xmode_change()
+    check("切回时间模式", w.x_mode == WaveCanvas.X_TIME, w.x_mode)
+    check("跨度候选项换回秒", tuple(app.span_box.cget("values")) == SPAN_SEC_CHOICES,
+          str(app.span_box.cget("values")))
+    check("横轴提示清空", app.span_hint.cget("text") == "",
+          app.span_hint.cget("text"))
+    w.draw(make(3000), force=True)
+    check("时间模式刻度恢复", w.itemcget(w._items["xlab"][0], "text").endswith("s"),
+          w.itemcget(w._items["xlab"][0], "text"))
+
+    # ---- 时间模式：时间戳的抖动不许传到屏幕上 ----
+    # 真机串口上帧时间戳是「设备时钟推算值」：USB 驱动一批 5 帧一起交上来，
+    # 推算步长有 1% 误差，几百帧后就与本地时钟错开，被「超前就拉回」的护栏
+    # 硬拽一下。若拿时间戳直接当 x，这一拽会让整条曲线在水平方向收一下、
+    # 再放开 —— 用户说的「每次刷新都把数据从前面推到后面」就是它。
+    # 现在横轴按点位序号铺，这类抖动必须完全看不出来。
+    def make_live(n: int = 3000):
+        now = time.time()
+        return [(now - (n - 1 - i) * dt + (-0.06 if i % 200 == 0 else 0.0),
+                 (float(i % 100), 0.5, -0.5, 0.0, 1.0, -1.0))
+                for i in range(n)]
+
+    w.draw(make_live(), force=True)
+    co = w.coords(w._items["curve"][0])
+    xs = co[0::2]
+    gaps = [b - a for a, b in zip(xs, xs[1:])]
+    # 最后一段是「抽稀也要保住最后一点」补上去的尾点，间距必然偏短，它单独看
+    body = gaps[:-1] if len(gaps) > 2 else gaps
+    check("时间戳抖动不会让点间距伸缩（横轴不跟时间戳走）",
+          bool(body) and max(body) - min(body) < 1e-6,
+          f"{len(xs)} 点，主体间距 {min(body):.3f}~{max(body):.3f}px")
+
+    # ---- 时间模式：每帧整体平移的量必须相等（匀速滚动）----
+    # 这一条直接对「定格感」：位移量就是时间轴右边界每帧前进的秒数。
+    # 以前它取的是**实测帧间隔**，Tk 定时器一抖，屏幕上就一帧走 3px、
+    # 下一帧走 6px —— 眼睛看到的就是一格一格。现在改用平滑后的周期。
+    # （不拿末点的像素 x 来量：抽稀的整步索引会让末端在 0~step 像素之间
+    #   锯齿，测不出匀速。）
+    # 按真机方式驱动：每帧到一批点（30ms × 500Hz = 15 个），切片跟着滑动。
+    # 位置必须由内部积分推进，而不是「n_all 涨了多少就跳多少」。
+    cnt = [3000]
+
+    def feed() -> None:
+        cnt[0] += 15
+        w.draw(make_live(), force=True, count=cnt[0])
+
+    for _ in range(12):                             # 预热：让平滑后的帧周期收敛
+        time.sleep(0.03)
+        feed()
+    ends = []
+    for _ in range(4):
+        time.sleep(0.03)
+        feed()
+        ends.append(w._pos_abs)      # 屏幕位置 = 绝对采样序号（kx 已定格，点数即像素）
+    d = [b - a for a, b in zip(ends, ends[1:])]
+    # 每帧到 15 个点、画一次，位置就该前进约 15 个点。
+    # （不换算成秒再比：比例 dt_est 本身还在 EMA 收敛，拿一个 3000+ 的绝对
+    #   序号去乘它，收敛期的微小变化会被放大成好几毫秒的假抖动。）
+    check("相邻帧的推进量一致（匀速滚动）",
+          len(d) == 3 and min(d) > 5.0 and max(d) - min(d) < 1.5,
+          f"每帧 {[round(x, 2) for x in d]} 个点")
+
+    # ---- 形状锁定：两帧之间必须是"整体平移" ----
+    # 以前 x0 带小数，Tk 对每个点独立取整 → 相邻两帧每个点的取整结果
+    # 各不相同，曲线**形状**每帧都在轻微变化 —— 看起来不像平移、
+    # 像擦掉重画（用户说的「数据从前面被推到后面」）。量子化到整数像素后，
+    # 每个点两帧之间的位移必须严格相等。
+    w.draw(make_live(), force=True, count=cnt[0])
+    dbg_a = getattr(w, "_dbg", None)
+    co_a = w.coords(w._items["curve"][0])[0::2]
+    time.sleep(0.03)
+    w.draw(make_live(), force=True, count=cnt[0] + 15)   # 前进 15 个点 = 30ms
+    dbg_b = getattr(w, "_dbg", None)
+    co_b = w.coords(w._items["curve"][0])[0::2]
+    # 只查主体：右端「保住最新点」的补点不在抽稀网格上，位移天然不同；
+    # k_hi 随右边界前进也会让总点数 ±1，都属正常。
+    n = int(min(len(co_a), len(co_b)) * 0.9)
+    if n > 10:
+        shifts = [b - a for a, b in zip(co_a[:n], co_b[:n])]
+        check("两帧之间是整体平移（形状完全锁定）",
+              max(shifts) - min(shifts) < 1e-9,
+              f"{n} 点位移差 {max(shifts) - min(shifts):.2e}px"
+              f"  A={dbg_a} B={dbg_b}")
+    else:
+        check("两帧之间是整体平移（形状完全锁定）", False,
+              f"点数太少 {len(co_a)}→{len(co_b)}")
+
+    # ---- 时间戳跳变不许让画面跳 ----
+    # 真机上这一跳**必然**发生：设备推流率不是精确 500Hz，sample_dt 推算的
+    # 设备时钟会慢慢攒出几十~几百毫秒误差，然后被「|now−_dev_t|>0.4s 就重锚」
+    # 硬拉一次。老实现把本机时钟口径的 t_end 和设备时钟口径的 newest 相夹，
+    # 一重锚就把右边界拽回去 —— 屏幕上整条曲线猛跳一截，看着就是「从头重来」。
+    # 现在横轴位置只由「落后多少个点」决定，与时间戳完全无关：跳变必须不可见。
+    for name, jump in (("前跳", +0.40), ("回跳", -0.08)):
+        w.reset()
+        w.draw(make(3000), force=True)
+        for _ in range(4):                          # 让它稳到目标落后量
+            time.sleep(0.03)
+            cnt[0] += 15
+            w.draw(make(3000), force=True, count=cnt[0])
+        x_before = w.coords(w._items["curve"][0])[-2]
+        jumped = [(t + (jump if i >= 2900 else 0.0), v)
+                  for i, (t, v) in enumerate(make(3000))]
+        time.sleep(0.03)
+        cnt[0] += 15
+        w.draw(jumped, force=True, count=cnt[0])
+        x_after = w.coords(w._items["curve"][0])[-2]
+        dx = x_after - x_before
+        check(f"时间戳{name} {abs(jump)*1000:.0f}ms 不影响画面（横轴只看点数）",
+              abs(dx) < 12.0,
+              f"右端位移 {dx:+.1f}px（老实现会跳 ~60px）")
+
+
+def test_serial_clock_pathology(root: tk.Tk, app: App) -> None:
+    section("9. 串口时间戳病态（真机独有，TCP 复现不出来）")
+    w = app.wave
+    # 摘掉实时链路：否则 App 自己的刷新循环会拿模拟器数据一起调 draw()，
+    # 两条 count 序列交叉喂进速率测量，测出来的 rate 是垃圾。
+    saved_cli = app.cli
+    app.cli = None
+    try:
+        _serial_clock_pathology(root, app, w)
+    finally:
+        app.cli = saved_cli
+
+
+def _serial_clock_pathology(root: tk.Tk, app: App, w: WaveCanvas) -> None:
+    app.xmode_var.set(X_MODE_TIME_LABEL)
+    app._on_xmode_change()
+    app.win_var.set("5")
+    app._on_window_change()
+    w.reset()                      # 相当于刚连上设备：速率/位置/窗口点数都从头量
+    root.update()
+
+    # 真机上协议层有一条兜底：设备时钟跑到本机时间前面时，时间戳按
+    # sample_dt*0.05 挤压过去（y75_protocol._handle_frame）。连续触发时，
+    # 相邻间隔就从 2ms 变成 0.1ms —— 而**帧计数仍然是准确的**。
+    # 老实现拿时间戳间隔当采样周期，一屏点数 = 5s / 0.1ms = 50000 点，
+    # 曲线被压到右边缘再随数据往左扫，就是「点从最右边刷到左边」。
+    true_dt = 0.002                                   # 真实 500Hz
+    sick_dt = 0.0001                                  # 被挤压后的时间戳间隔
+    n = 4000
+    cnt = [n]
+
+    def make(gap: float) -> list:
+        # 最新点始终锚在本机时间上，只改**相邻间隔** —— 这样自适应延迟不会
+        # 因为「样本看起来很旧」而饱和，测到的就纯粹是间隔被压扁这一个变量。
+        base = time.time()
+        return [(base - (n - 1 - i) * gap,
+                 (float(i % 100), 0.5, -0.5, 0.0, 1.0, -1.0))
+                for i in range(n)]
+
+    def feed(gap: float) -> None:
+        time.sleep(0.03)
+        cnt[0] += 15
+        w.draw(make(gap), force=True, count=cnt[0])
+
+    for _ in range(14):                               # 先用规整时间戳预热
+        feed(true_dt)
+    np_ok = w.np_win()
+    for _ in range(14):                               # 再切成病态时间戳
+        feed(sick_dt)
+
+    check("时间戳被压到 0.1ms 也不改「一屏多少点」",
+          w.np_win() == np_ok and 500.0 < np_ok < 10000.0,
+          f"np_win {np_ok:.0f} → {w.np_win():.0f} 点"
+          f"（老实现按时间戳算会变成 {5 / sick_dt:.0f}）")
+    check("采样周期取自帧计数，不被时间戳污染",
+          abs(w.dt_est - 1.0 / w._rate_pts) < 1e-12 and w.dt_est > 20 * sick_dt,
+          f"dt_est={w.dt_est * 1000:.3f}ms（帧计数实测 {w._rate_pts:.0f}Hz），"
+          f"病态时间戳会说 {sick_dt * 1000:.1f}ms")
+
+    # 曲线必须铺满画布，而不是缩在右边缘
+    co = w.coords(w._items["curve"][0])
+    xs = co[0::2]
+    pad_l, pad_r = WaveCanvas.PAD_L, WaveCanvas.PAD_R
+    usable = w.winfo_width() - pad_l - pad_r
+    check("曲线铺满整个绘图区（没有被挤到右边缘）",
+          len(xs) > 50 and (max(xs) - min(xs)) > usable * 0.8,
+          f"横向跨度 {max(xs) - min(xs):.0f}px / 可用 {usable:.0f}px，{len(xs)} 点")
+
+    # 恢复规整时间戳后必须继续正常滚动
+    make_ok = lambda: make(true_dt)                   # noqa: E731
+
+    poses = []
+    for _ in range(4):
+        time.sleep(0.03)
+        cnt[0] += 15
+        w.draw(make_ok(), force=True, count=cnt[0])
+        poses.append(w._pos_abs)
+    d = [b - a for a, b in zip(poses, poses[1:])]
+    check("病态时间戳消失后滚动依旧匀速",
+          len(d) == 3 and min(d) > 5.0 and max(d) - min(d) < 1.5,
+          f"每帧 {[round(x, 2) for x in d]} 个点")
 
 
 def main() -> int:
@@ -506,11 +846,14 @@ def main() -> int:
     try:
         test_connect(root, app, host, port)
         test_stream(root, app)
+        test_bus_panel(root, app)
         test_single_and_settings(root, app)
         test_matrix(root, app)
         test_save(root, app, tmpdir)
         test_layout(root, app)
         test_wave_decoupled(root, app)
+        test_points_axis(root, app)
+        test_serial_clock_pathology(root, app)
         test_errors(root, app, host)
     except Exception as exc:                                  # pragma: no cover
         import traceback

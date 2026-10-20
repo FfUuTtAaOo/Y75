@@ -15,6 +15,7 @@ test_link.py —— 协议层回归测试（不需要硬件）
   * 帧编解码 / 字节序
   * 连接、命令收发、超时
   * 连续推流（帧率、数值随时间变化、缓冲不泄漏）
+  * 停止→开始：波形时间基准不许漂（时间戳不冲进未来、节拍不被断流带偏）
   * 单次采集
   * 序列号 / 版本 / 状态（含裸 ASCII 回复）
   * 频率、单位、输出模式（HEX ↔ ASC）
@@ -29,6 +30,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import random
 import socket
 import subprocess
 import sys
@@ -40,8 +42,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from y75_protocol import (  # noqa: E402
-    ASC_FRAME_LEN, ASC_SENTINEL, ByteOrder, CMD_QUERY_MATRIX, EOF, SOF, TcpTransport,
-    Y75Client, Y75Error, Y75Timeout, build_cmd, dump_matrix, fmt_value,
+    ASC_FRAME_LEN, ASC_SENTINEL, ByteOrder, BusGate, CMD_QUERY_MATRIX, EOF, SOF,
+    TcpTransport, Y75Client, Y75Error, Y75Timeout, build_cmd, dump_matrix, fmt_value,
     parse_matrix_text,
 )
 
@@ -160,6 +162,17 @@ def test_stream(cli: Y75Client) -> None:
     _, snap2 = cli.take_wave()
     check("take_wave 无新数据时返回空（界面不必重绘）", snap2 == [])
 
+    # 点数横轴按「个数」取：切到点数模式后，界面要的是一条定长尾巴
+    time.sleep(0.05)
+    _, snap3 = cli.take_wave(max_points=50)
+    check("take_wave(max_points) 按个数取，且取的是最新的一段",
+          len(snap3) == min(50, len(cli.wave)) and snap3[-1] == cli.wave[-1],
+          f"{len(snap3)} 点，与缓冲尾部一致={bool(snap3) and snap3[-1] == cli.wave[-1]}")
+    time.sleep(0.05)
+    _, snap4 = cli.take_wave(999.0, max_points=30)
+    check("同时给 window_sec 和 max_points 时以点数为准",
+          len(snap4) == min(30, len(cli.wave)), f"{len(snap4)} 点")
+
     check("推流期间 latest 一直有值",
           all(v is not None for v in cli.latest), str(cli.latest and cli.latest[0]))
 
@@ -168,6 +181,58 @@ def test_stream(cli: Y75Client) -> None:
     n1 = cli.push_count
     time.sleep(0.4)
     check("停止后不再有帧", cli.push_count == n1, f"{cli.push_count} == {n1}")
+
+
+def test_stream_clock(cli: Y75Client) -> None:
+    """
+    起停几次推流，检查波形的「时间基准」有没有被断流带坏。
+
+    回归的现象：点「停止」→「开始」之后实时波形只画一半，再来一次只剩
+    四分之一。两处毛病叠在一起：
+
+    * `_dev_t` 停在断流那一刻，重启后第一帧只要差值 <0.4s 就不重锚，
+      这份滞后会被一路带着走（波形右端永远缺一截）；
+    * 节拍统计窗横跨空洞，0.5s 窗里只剩重启后那几十帧，量出的 `sample_dt`
+      是真实值的几倍；它是等间隔推算的步长，于是时间戳直奔未来，
+      可视窗里只剩旧数据 —— 剩下的就是「一半 / 四分之一」。
+    """
+    section("3b. 停止→开始：波形时间基准不许漂")
+    cli.stop()
+    time.sleep(0.2)
+
+    for _ in range(3):
+        base = cli.push_count
+        cli.start()
+        wait_push(cli, base, 1.0)
+        time.sleep(0.5)
+        cli.stop()
+        time.sleep(0.9)              # 人工点「停止」「开始」大概就是这个间隔
+
+    base = cli.push_count
+    cli.start()
+    wait_push(cli, base, 1.0)
+    time.sleep(1.2)
+
+    lag = time.time() - cli.wave[-1][0]
+    check("最新样本时间戳与本机时间对齐（没冲进未来）",
+          -cli.TS_AHEAD - 0.02 <= lag <= 0.6,
+          f"lag={lag * 1000:+.0f}ms（允许超前 {cli.TS_AHEAD * 1000:.0f}ms）")
+    check("实测节拍没被断流空洞带偏（≈2ms）",
+          0.0014 <= cli.sample_dt <= 0.0032, f"{cli.sample_dt * 1000:.3f}ms")
+
+    # 只看「最后一次开始」之后的那一段：跨过断流点的样本中间是真空白
+    # （那 0.9s 设备确实没发帧），跨度自然对不上，不是 bug。
+    _, samples = cli.take_wave(max_points=300)
+    ivs = sorted(b[0] - a[0] for a, b in zip(samples, samples[1:]))
+    med = ivs[len(ivs) // 2] if ivs else 0.0
+    span = samples[-1][0] - samples[0][0] if samples else 0.0
+    expect = (len(samples) - 1) * med if samples else 0.0
+    check("重启后最近 300 点是等间距的一段（点数横轴按它铺格子）",
+          len(samples) == 300 and expect > 0 and abs(span - expect) / expect < 0.08,
+          f"{len(samples)} 点跨 {span:.2f}s，中位间隔 {med * 1000:.2f}ms")
+
+    cli.stop()
+    time.sleep(0.2)
 
 
 def test_freq_and_format(cli: Y75Client) -> None:
@@ -360,8 +425,223 @@ def test_short_frames(host: str, port: int) -> None:
         proc.wait()
 
 
+class _RecTransport(TcpTransport):
+    """
+    记录每次 write 的时刻，以及「写之前最近一次收到字节」的时刻。
+
+    用来验证出站字节确实走了总线仲裁：写下去的那一刻，距最近一次收到
+    字节必须已经静默够久（说明当前那一帧收完了），而不是帧发到一半。
+    """
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.writes: List[Tuple[float, bytes, float]] = []
+        self.last_rx_t = 0.0
+
+    def recv(self, timeout: float) -> bytes:
+        data = super().recv(timeout)
+        if data:
+            self.last_rx_t = time.time()
+        return data
+
+    def write(self, data: bytes) -> None:
+        self.writes.append((time.time(), bytes(data), self.last_rx_t))
+        super().write(data)
+
+
+def test_bus_gate(host: str, port: int) -> None:
+    """
+    半双工 485 的「发言权」：推流中发命令不能撞车。
+
+    真机现象：MAX13487 是自动方向芯片，主机没法控制总线方向。设备在连续
+    推流时如果上位机把命令拍下去，两个驱动器会同时拉总线 —— 逻辑分析仪上
+    能看到收发重叠，设备侧拆帧错乱（严重时进 HardFault），上位机这边则是
+    命令没应答。
+
+    这里用模拟器的 --collide 模式复现同一件事：设备「正在线上发字节」的
+    那 0.63ms 窗口内收到的命令一律丢弃、并往流里插垃圾字节。于是
+    「关掉仲裁会撞车、打开仲裁不撞车」就成了可量化的断言。
+    """
+    section("11. 半双工总线仲裁（推流中不撞车）")
+
+    # ---- 11a 纯逻辑：阈值与放行条件 ----
+    g = BusGate()
+    g.sample_dt = 0.002
+    check("500Hz 帧后窗口 ≈ 0.7ms（0.35 个帧周期）",
+          abs(g.window_s() * 1000.0 - 0.7) < 0.06, f"{g.window_s() * 1000:.3f} ms")
+    g.sample_dt = 0.001
+    check("1000Hz 帧后窗口 ≈ 0.35ms", abs(g.window_s() * 1000.0 - 0.35) < 0.06,
+          f"{g.window_s() * 1000:.3f} ms")
+    check("发送后保护窗口 = 2 个帧周期",
+          abs(g.guard_s() * 1000.0 - 2.0) < 0.15, f"{g.guard_s() * 1000:.3f} ms")
+    check("静默判据 = 4 个帧周期（下限 4ms）",
+          abs(g.idle_s() * 1000.0 - 4.0) < 0.2, f"{g.idle_s() * 1000:.2f} ms")
+
+    g = BusGate()
+    g.enabled = False
+    t0 = time.time()
+    g.wait_idle(lambda: True)
+    check("关掉仲裁后立刻放行（回到老行为）", (time.time() - t0) * 1000.0 < 1.0)
+
+    # 有帧流时：必须被「帧收完」这个事件唤醒，而不是睡到某个固定时刻。
+    # reaction = 从「收完整帧」到 wait_idle 返回的时间差 —— 越小越好，
+    # 因为帧间空隙只有 1.37ms，反应慢就直接踩进下一帧。
+    g = BusGate()
+    g.sample_dt = 0.002
+
+    class _Feeder(threading.Thread):
+        def __init__(self, gate, period=0.002):
+            super().__init__(daemon=True)
+            self.gate, self.period = gate, period
+            self.stop_ev = threading.Event()
+            self.last = 0.0
+
+        def run(self):
+            while not self.stop_ev.is_set():
+                self.gate.note_frame(data=True)      # 数据帧才产生「可发」边界
+                self.last = time.time()
+                time.sleep(self.period)
+
+    f = _Feeder(g)
+    f.start()
+    time.sleep(0.03)
+    waits, reacts = [], []
+    for _ in range(15):
+        t0 = time.time()
+        g.wait_idle(lambda: False)
+        waits.append((time.time() - t0) * 1000.0)
+        reacts.append((time.time() - f.last) * 1000.0)
+        time.sleep(0.0037)                  # 故意错开相位，避免每次都撞在同一相位
+    f.stop_ev.set()
+
+    check("有帧流时每次都在 1 个帧周期左右拿到空隙",
+          max(waits) <= 3.0, f"最长 {max(waits):.2f} ms / 帧周期 2.00 ms")
+    check("拿到空隙的反应延迟足够小（≤0.5ms，否则会踩进下一帧）",
+          sorted(reacts)[len(reacts) // 2] <= 0.5,
+          f"中位 {sorted(reacts)[len(reacts) // 2]:.3f} ms，最大 {max(reacts):.3f} ms")
+    check("干净帧流下不会走到 blind / timeout",
+          g.blind == 0 and g.timeouts == 0,
+          f"blind={g.blind} timeout={g.timeouts}")
+
+    # 只收到字节、攒不成整帧（半帧）→ 不能发，等够 3 帧认了
+    g = BusGate()
+    g.sample_dt = 0.002
+    g.note_rx()
+    t0 = time.time()
+    g.wait_idle(lambda: True)
+    dt = (time.time() - t0) * 1000.0
+    check("帧没收完就不发：等到 3 帧才认（计入 blind）",
+          4.0 <= dt <= 14.0 and g.blind == 1, f"等了 {dt:.1f} ms, blind={g.blind}")
+
+    # 自己刚发过 → guard 内不发
+    g = BusGate()
+    g.sample_dt = 0.002
+    f = _Feeder(g)
+    f.start()
+    time.sleep(0.01)
+    g.note_tx()
+    t0 = time.time()
+    g.wait_idle(lambda: False)
+    dt = (time.time() - t0) * 1000.0
+    f.stop_ev.set()
+    check("自己刚发过时先等够 guard（2 个帧周期）再发", dt >= 3.0, f"等了 {dt:.2f} ms")
+
+    # 总线长时间静默 → 立刻放行
+    g = BusGate()
+    g.note_frame(time.time() - 0.1)
+    g.note_rx(time.time() - 0.1)
+    t0 = time.time()
+    g.wait_idle(lambda: True)
+    dt = (time.time() - t0) * 1000.0
+    check("总线静默超过 4 个帧周期时立刻放行（设备没在推流）", dt < 2.0,
+          f"等了 {dt:.2f} ms")
+
+    # ---- 11b 实测：会撞车的模拟器 ----
+    sim_port = port + 149
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(HERE, "y75_simulator.py"),
+         "--port", str(sim_port), "--collide", "--rate-hz", "250", "--quiet"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    tr = None
+    try:
+        if not wait_port(host, sim_port, 6.0):
+            check("撞车模拟器启动", False, "起不来")
+            return
+        tr = _RecTransport(host, sim_port, timeout=1.0)
+        cli = Y75Client(tr)
+        cli.connect()
+        try:
+            check("默认开启总线仲裁", cli.bus.enabled)
+            cli.start()
+            time.sleep(1.0)
+            dt_ms = cli.sample_dt * 1000.0
+            cli.bus.reset()                 # 只统计下面这 8 条命令
+
+            # (1) 仲裁开着：推流中连发 8 条命令，应当全部拿到应答
+            ok = 0
+            for _ in range(8):
+                try:
+                    cli.query_ver(timeout=0.30)
+                    ok += 1
+                except (Y75Timeout, Y75Error):
+                    pass
+            gb = cli.garbage_bytes
+            # 这是实时性断言，不是逻辑断言：Windows 线程调度本身就有几百微秒
+            # 的抖动，而 250Hz 下的帧间空隙是 3.4ms。允许 8 条里有 1 条被调度
+            # 抖动耽误（那一条会在后面的「关闭仲裁」对照里更明显地暴露出来）。
+            check("推流中 8 条命令基本都能拿到应答（≤1 条被抖动耽误）", ok >= 7,
+                  f"{ok}/8")
+            check("总线上基本没有撞车垃圾字节（≤2 字节）", gb <= 2,
+                  f"garbage={gb} 字节")
+            check("每次都找到了干净的帧边界（没走到 blind / timeout）",
+                  cli.bus.blind == 0 and cli.bus.timeouts == 0,
+                  f"blind={cli.bus.blind} timeout={cli.bus.timeouts}")
+
+            # 写下去的那一刻，离最近一次收到字节有多远？
+            gaps = [(t - rx) * 1000.0 for t, _, rx in tr.writes[-8:] if rx > 0.0]
+            if gaps:
+                check("写入紧跟在「一帧收完」之后（≤1.2 个帧周期，含调度抖动）",
+                      max(gaps) <= dt_ms * 1.2,
+                      f"最大 {max(gaps):.2f} ms / 帧周期 {dt_ms:.2f} ms")
+            else:
+                check("写入紧跟在「一帧收完」之后", False, "没记录到接收时刻")
+
+            # (2) 关掉仲裁：同样的命令应当开始撞车
+            cli.bus.enabled = False
+            gb0 = cli.garbage_bytes
+            bad = 0
+            for _ in range(12):
+                # 仲裁关掉后，命令就在「用户随手点一下」的时刻拍下去 ——
+                # 相对推流帧的相位是随机的，正中设备发送窗口的概率约 30%
+                time.sleep(random.uniform(0.0, cli.sample_dt))
+                try:
+                    cli.query_ver(timeout=0.25)
+                except (Y75Timeout, Y75Error):
+                    bad += 1
+            gb1 = cli.garbage_bytes
+            check("关掉仲裁后撞车明显变多（证明上面的「没撞」不是碰巧）",
+                  bad >= 3 and bad > (8 - ok),
+                  f"关闭：失败 {bad}/12、垃圾 +{gb1 - gb0} 字节；"
+                  f"开启：失败 {8 - ok}/8、垃圾 {gb} 字节")
+
+            # (3) 推流中「停止」：这才是用户遇到的场景
+            cli.bus.enabled = True
+            cli.stop()
+            n0 = cli.push_count
+            time.sleep(0.35)
+            check("推流中「停止」能落地（设备真的停下来了）",
+                  cli.push_count - n0 <= 2,
+                  f"停止后 0.35s 内又来了 {cli.push_count - n0} 帧")
+        finally:
+            cli.disconnect()
+    finally:
+        if proc is not None:
+            proc.kill()
+            proc.wait()
+
+
 def test_disconnect(cli: Y75Client, host: str, port: int) -> None:
-    section("10. 断线与清理")
+    section("12. 断线与清理")
     cli.disconnect()
     check("断开后 is_connected=False", not cli.is_connected())
     try:
@@ -484,6 +764,7 @@ def main() -> int:
         test_connect_and_basics(cli)
         test_single(cli)
         test_stream(cli)
+        test_stream_clock(cli)
         test_freq_and_format(cli)
         test_matrix(cli)
         test_zero(cli)
@@ -491,6 +772,7 @@ def main() -> int:
         test_bad_frames(host, port)
         test_by_order(host, port)
         test_short_frames(host, port)
+        test_bus_gate(host, port)
         test_disconnect(cli, host, port)
     except Exception as exc:                         # pragma: no cover
         import traceback

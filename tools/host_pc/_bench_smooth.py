@@ -31,12 +31,13 @@ def main() -> int:
     ap.add_argument("--burst-ms", type=float, default=16.0, help="模拟的 USB 批量周期")
     ap.add_argument("--secs", type=float, default=12.0, help="测量时长")
     ap.add_argument("--port", type=int, default=15220)
+    ap.add_argument("--fps", default="", help="覆盖刷新率设定（如 60）")
     ap.add_argument("--freq", type=int, default=500)
     args = ap.parse_args()
 
     import tkinter as tk
     import y75_app as app_mod
-    from y75_app import App, WaveCanvas
+    from y75_app import App, WaveCanvas, raise_timer_resolution
     from y75_protocol import TcpTransport
 
     if args.legacy:
@@ -64,12 +65,21 @@ def main() -> int:
 
     # ---- 记录每次重画后的时间轴位置 ----
     draws = []
+    cost = []
+    scale = [0.002]          # 最后收敛到的采样周期（秒/点），用来把点数换算成毫秒
     orig_draw = WaveCanvas.draw
 
-    def draw_hook(self, samples, force=False):
-        r = orig_draw(self, samples, force=force)
-        if self._t_end is not None:
-            draws.append((time.time(), self._t_end))
+    def draw_hook(self, samples, force=False, count=None):
+        t0 = time.perf_counter()
+        r = orig_draw(self, samples, force=force, count=count)
+        cost.append((time.perf_counter() - t0) * 1000.0)
+        # 记录**绝对采样序号**：它是真正决定屏幕位置的那个量。
+        # 不要在这里乘 dt_est 换算成秒 —— dt_est 本身还在 EMA 收敛，
+        # 拿一个几千的绝对序号去乘它，收敛期的微小变化会被放大成上百毫秒
+        # 的假抖动（实测能把变异系数从 5% 顶到 324%）。换算留到最后用
+        # 一个**固定**比例做。
+        draws.append((time.time(), self._pos_abs))
+        scale[0] = self.dt_est or 0.002
         return r
 
     WaveCanvas.draw = draw_hook
@@ -84,6 +94,7 @@ def main() -> int:
         selftest = False
         autoconnect = True
 
+    raise_timer_resolution()   # 和正式程序一致：定时器粒度 15.6ms → 1ms
     root = tk.Tk()
     root.geometry("1400x900+40+40")
     app = App(root, Args())
@@ -147,6 +158,34 @@ def main() -> int:
 
     # ---- 4. 波形有效帧率 ----
     print(f"重画次数 {len(draws)} 次，约 {len(draws) / max(elapsed, 0.01):.1f} fps")
+
+    # ---- 5. 时间轴被「数据不够新」夹住的次数 ----
+    # 每夹一次，右边界就停一下、等下一批到了再走 —— 肉眼就是「一顿一顿」，
+    # 连续夹 + 追赶会像整条曲线「重新加载」。理想值：0。
+    if app.wave is not None:
+        cn, cs = app.wave.clamp_n, app.wave.clamp_sec
+        print(f"时间轴被夹住 {cn} 次（累计 {cs * 1000:.0f}ms，占 "
+              f"{cs / max(elapsed, 0.01) * 100:.1f}% 时间）  理想值 0")
+        print(f"自适应显示延迟 {app.wave.latency * 1000:.0f}ms "
+              f"（样本年龄峰值 {app.wave._age_peak * 1000:.0f}ms）")
+    if cost:
+        c_s = sorted(cost)
+        print(f"单帧绘制耗时：中位 {c_s[len(c_s) // 2]:.1f}ms  "
+              f"P95 {c_s[len(c_s) * 19 // 20]:.1f}ms  最大 {c_s[-1]:.1f}ms"
+              f"  （它决定了 fps 上限）")
+
+    # ---- 6. 时间轴每帧推进了多少（定格感 = 这个值忽大忽小）----
+    if len(draws) > 4:
+        k = scale[0]                     # 点数 → 秒，用一个固定比例换算
+        d = [(t2 - t1) * k for (_, t1), (_, t2) in zip(draws, draws[1:])]
+        d_s = sorted(d)
+        mean = sum(d) / len(d)
+        med = d_s[len(d) // 2]
+        cv = ((sum((x - mean) ** 2 for x in d) / len(d)) ** 0.5 / mean) if mean else 0
+        print(f"每帧推进：P5 {d_s[len(d) // 20] * 1000:.1f}ms  "
+              f"中位 {med * 1000:.1f}ms  P95 {d_s[len(d) * 19 // 20] * 1000:.1f}ms  "
+              f"最小 {d_s[0] * 1000:.1f}ms  最大 {d_s[-1] * 1000:.1f}ms  "
+              f"变异系数 {cv * 100:.0f}%（越小越匀速，>60% 就是定格感）")
     return 0
 
 
