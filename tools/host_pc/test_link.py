@@ -42,9 +42,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from y75_protocol import (  # noqa: E402
-    ASC_FRAME_LEN, ASC_SENTINEL, ByteOrder, BusGate, CMD_QUERY_MATRIX, EOF, SOF,
-    TcpTransport, Y75Client, Y75Error, Y75Timeout, build_cmd, dump_matrix, fmt_value,
-    parse_matrix_text,
+    ASC_FRAME_LEN, ASC_SENTINEL, ByteOrder, BusGate, CMD_QUERY_MATRIX, CMD_START,
+    CMD_STOP, EOF, SOF, TcpTransport, Y75Client, Y75Error, Y75Timeout, build_cmd,
+    dump_matrix, fmt_value, parse_matrix_text,
 )
 
 PASS = FAIL = 0
@@ -134,24 +134,34 @@ def test_single(cli: Y75Client) -> None:
 
 
 def test_stream(cli: Y75Client) -> None:
-    section("3. 连续推流")
+    section("3. 连续采集（0x03 轮询，每 50ms 一条）")
     cli.stop()
     time.sleep(0.1)
     base = cli.push_count
     cli.start()
-    check("开始连续发送：收到 ACK 后立刻有帧", wait_push(cli, base, 1.0))
+    check("开始连续：轮询线程已启动", cli.is_polling())
+    check("开始连续：1 秒内就有数据帧（实际 50ms 内）", wait_push(cli, base, 1.0))
 
     n0 = cli.push_count
     t0 = time.time()
     time.sleep(1.0)
     dt = time.time() - t0
     rate = (cli.push_count - n0) / dt
-    check("推流速率接近 500 Hz", 250 <= rate <= 800, f"实测 {rate:.0f} Hz")
+    check("轮询速率 ≈ 20 Hz", 14 <= rate <= 26, f"实测 {rate:.1f} Hz")
+
+    # 已在轮询时再点一次「开始」：不得叠加第二个轮询线程
+    cli.start()
+    n1 = cli.push_count
+    time.sleep(1.0)
+    rate2 = (cli.push_count - n1) / dt
+    check("重复点开始不叠加轮询（速率不翻倍）", 14 <= rate2 <= 26,
+          f"实测 {rate2:.1f} Hz")
 
     # 数值必须随时间变化，否则波形是直线
-    seen = [v for _, v in list(cli.wave)[-40:]]
+    time.sleep(0.2)
+    seen = [v for _, v in list(cli.wave)[-20:]]
     distinct = len({tuple(round(x, 5) for x in s) for s in seen})
-    check("推流数值逐帧变化（不是同一份数据重发）", distinct >= 10,
+    check("轮询数值逐帧变化（不是同一份数据重发）", distinct >= 6,
           f"{len(seen)} 帧里有 {distinct} 种取值")
 
     check("波形缓冲有上限（不会无限增长）",
@@ -173,10 +183,11 @@ def test_stream(cli: Y75Client) -> None:
     check("同时给 window_sec 和 max_points 时以点数为准",
           len(snap4) == min(30, len(cli.wave)), f"{len(snap4)} 点")
 
-    check("推流期间 latest 一直有值",
+    check("轮询期间 latest 一直有值",
           all(v is not None for v in cli.latest), str(cli.latest and cli.latest[0]))
 
     cli.stop()
+    check("停止后轮询线程退出", not cli.is_polling())
     time.sleep(0.25)
     n1 = cli.push_count
     time.sleep(0.4)
@@ -211,7 +222,7 @@ def test_stream_clock(cli: Y75Client) -> None:
     base = cli.push_count
     cli.start()
     wait_push(cli, base, 1.0)
-    time.sleep(1.2)
+    time.sleep(1.4)                       # 20Hz 轮询：1.4s ≈ 28 帧
 
     lag = time.time() - cli.wave[-1][0]
     check("最新样本时间戳与本机时间对齐（没冲进未来）",
@@ -222,13 +233,14 @@ def test_stream_clock(cli: Y75Client) -> None:
 
     # 只看「最后一次开始」之后的那一段：跨过断流点的样本中间是真空白
     # （那 0.9s 设备确实没发帧），跨度自然对不上，不是 bug。
-    _, samples = cli.take_wave(max_points=300)
+    # 轮询 20Hz，取 25 点（≈1.2s）；等间距按 50ms 铺格子。
+    _, samples = cli.take_wave(max_points=25)
     ivs = sorted(b[0] - a[0] for a, b in zip(samples, samples[1:]))
     med = ivs[len(ivs) // 2] if ivs else 0.0
     span = samples[-1][0] - samples[0][0] if samples else 0.0
     expect = (len(samples) - 1) * med if samples else 0.0
-    check("重启后最近 300 点是等间距的一段（点数横轴按它铺格子）",
-          len(samples) == 300 and expect > 0 and abs(span - expect) / expect < 0.08,
+    check("重启后最近 25 点是等间距的一段（点数横轴按它铺格子）",
+          len(samples) == 25 and expect > 0 and abs(span - expect) / expect < 0.08,
           f"{len(samples)} 点跨 {span:.2f}s，中位间隔 {med * 1000:.2f}ms")
 
     cli.stop()
@@ -408,8 +420,8 @@ def test_short_frames(host: str, port: int) -> None:
             base = cli.push_count
             time.sleep(1.0)
             got = cli.push_count - base
-            check("畸形帧混流下推流仍能正常接收", got > 200, f"1 秒内收到 {got} 帧")
-            check("畸形帧被识别并计数", cli.short_frames > 100, f"short={cli.short_frames}")
+            check("畸形帧混流下轮询仍能正常接收", got >= 12, f"1 秒内收到 {got} 帧")
+            check("畸形帧被识别并计数", cli.short_frames >= 10, f"short={cli.short_frames}")
             check("畸形帧不触发拆帧重同步", cli.frame_errors == 0,
                   f"resync={cli.frame_errors}")
             check("有效数据不被当成乱码丢掉", cli.garbage_bytes == 0,
@@ -572,7 +584,9 @@ def test_bus_gate(host: str, port: int) -> None:
         cli.connect()
         try:
             check("默认开启总线仲裁", cli.bus.enabled)
-            cli.start()
+            # 轮询模式下主机不再发 0x02，设备不会自行推流；撞车场景改用
+            # 裸写把模拟器推进推流态（等价于老固件残留 / 「自动启动」标志）。
+            cli._bus_write(build_cmd(CMD_START))
             time.sleep(1.0)
             dt_ms = cli.sample_dt * 1000.0
             cli.bus.reset()                 # 只统计下面这 8 条命令

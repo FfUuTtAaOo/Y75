@@ -118,7 +118,7 @@ def test_stream(root: tk.Tk, app: App) -> None:
     cli = app.cli
     assert cli is not None
     got = wait_for(root, lambda: cli.push_count > 5, 2.0)
-    check("开始后立刻收到推流帧", got, f"push_count={cli.push_count}")
+    check("开始后立刻收到数据帧（50ms 轮询一拍）", got, f"push_count={cli.push_count}")
 
     # 数值卡片必须显示真实数值，不能是「—」
     wait_for(root, lambda: app.cards[0][0].cget("text") != "—", 2.0)
@@ -128,10 +128,13 @@ def test_stream(root: tk.Tk, app: App) -> None:
           all(_is_num(l.cget("text")) for l, _ in app.cards),
           ", ".join(l.cget("text") for l, _ in app.cards))
 
-    check("运行统计：帧率 > 100Hz",
-          wait_for(root, lambda: app.frame_rate > 100, 2.0),
+    # 轮询模式 20 Hz：帧率统计要给区间，不能按老推流的 500Hz 口径
+    check("运行统计：帧率 ≈ 20Hz（50ms 轮询）",
+          wait_for(root, lambda: 12 <= app.frame_rate <= 30, 3.0),
           f"{app.frame_rate:.0f} Hz")
-    check("运行统计：已收帧在增长", cli.push_count > 20, str(cli.push_count))
+    check("运行统计：已收帧在增长",
+          wait_for(root, lambda: cli.push_count > 20, 3.0),
+          str(cli.push_count))
     check("状态横条写着已连接", "已连接" in app.conn_label.cget("text"))
 
     # 波形必须真的画了线（Canvas 上的 line 数 > 0）
@@ -224,7 +227,16 @@ def test_single_and_settings(root: tk.Tk, app: App) -> None:
     check("应用输出设置完成", wait_idle(root, app))
     check("单位标签跟随变成 kg", app.cards[0][1].cget("text") == "kg",
           app.cards[0][1].cget("text"))
+    check("力矩标签变成 kg·m", app.cards[3][1].cget("text") == "kg·m",
+          app.cards[3][1].cget("text"))
     check("波形单位也变成 kg", app.wave.unit == "kg", app.wave.unit)
+
+    # 切到 N：力矩通道应显示 N·m（力 × 力臂 的量纲，不是纯 N）
+    app.fmt_var.set("矩阵解耦 (N)")
+    app.on_apply_output()
+    check("应用输出设置完成", wait_idle(root, app))
+    check("N 模式下力矩标签是 N·m", app.cards[5][1].cget("text") == "N·m",
+          app.cards[5][1].cget("text"))
 
     # ASC 调试模式：数据帧变成裸 28 字节，界面必须照常出数
     app.out_var.set(OUT_ASC)
@@ -306,7 +318,7 @@ def test_save(root: tk.Tk, app: App, tmpdir: str) -> None:
     cli = app.cli
     assert cli is not None
     n0 = cli.push_count
-    check("保存期间持续收帧", wait_for(root, lambda: cli.push_count > n0 + 100, 3.0),
+    check("保存期间持续收帧", wait_for(root, lambda: cli.push_count > n0 + 40, 4.0),
           f"{cli.push_count - n0} 帧")
     time.sleep(0.5)
     root.update()
@@ -322,7 +334,7 @@ def test_save(root: tk.Tk, app: App, tmpdir: str) -> None:
     heads = re.findall(r"<t[^>]*>([^<]*)</t>", sheet)
     check("表头是六个力通道", heads == list(AXIS_NAMES), str(heads))
     nrows = sheet.count("<row ")
-    check("写入行数合理（表头 + 上百行数据）", nrows > 50, f"{nrows} 行")
+    check("写入行数合理（表头 + 轮询数据行）", nrows > 35, f"{nrows} 行")
     check("工作表名正确", "六维力数据" in wb)
 
     rows = re.findall(r'<row r="(\d+)">(.*?)</row>', sheet)

@@ -80,6 +80,10 @@ CMD_SET_N = 0x35               # 数据单位：N（掉电保持）
 CMD_UNZERO = 0x36
 CMD_QUERY_MATRIX = 0x37
 
+#: 「开始连续」的轮询节拍：每 50 ms 发一条 0x03，设备逐条回一帧数据。
+#: （固件的 0x02 推流只保留给老版本上位机；本版 start() 不再发送 0x02。）
+POLL_INTERVAL = 0.05
+
 #: 命令码 → (中文名, 一句话说明)
 COMMANDS: Dict[int, Tuple[str, str]] = {
     CMD_STOP:         ("停止连续发送", "设备回复 ACK，停止 500/1000Hz 推流"),
@@ -819,6 +823,11 @@ class Y75Client:
         #: 所以默认关掉；只在「命令丢了、总线又确实空」时人工调大更稳。
         self.bus_retry = 0
         self._waiter: Optional[_Waiter] = None
+        #: 「开始连续」的 0x03 轮询线程（见 start()/_poll_loop()）。
+        #: 发命令一律走 _cmd_lock 串行，所以轮询和手动命令不会互相踩 waiter。
+        self._poll_lock = threading.Lock()
+        self._poll_stop = threading.Event()
+        self._poll_thread: Optional[threading.Thread] = None
         self._text_buf = bytearray()
         self._last_rx = 0.0
         self._push_snapshot = 0
@@ -850,7 +859,7 @@ class Y75Client:
         # ---- 对外状态 ----
         self.latest: Tuple[Optional[float], ...] = (None,) * 6
         self.push_count = 0            # 数据帧累计
-        self.stream_count = 0          # 其中来自连续推流的帧数
+        self.stream_count = 0          # 其中的数据帧数（0x02 推流 / 0x03 轮询应答）
         self.frame_errors = 0          # 拆帧重同步次数
         self.cmd_errors = 0            # 协议层命令错误次数
         self.garbage_bytes = 0         # 丢弃的乱码字节数
@@ -894,6 +903,8 @@ class Y75Client:
         self.bus.sample_dt = self.sample_dt
         self._rate_t0 = 0.0
         self._rate_n0 = 0
+        self._poll_stop.clear()            # 上次会话的轮询停表位清掉
+        self._poll_thread = None
         self._log_gate.clear()
         self._stop.clear()
         self._reader = threading.Thread(target=self._read_loop, name="y75-rx", daemon=True)
@@ -902,6 +913,7 @@ class Y75Client:
         self._state("connected", self.transport.name)
 
     def disconnect(self) -> None:
+        self._stop_polling()               # 先停轮询，别让它对着已关闭的传输发命令
         reader, self._reader = self._reader, None
         self._stop.set()
         try:
@@ -1094,31 +1106,38 @@ class Y75Client:
                         # 所以这里硬拉回本机时间，让推算重新对齐。
                         self._dev_t = now
                 ts = self._dev_t
-                self.stream_count += 1
             else:
                 ts = now
                 self._dev_t = now                      # 单次应答帧把设备时钟拉到当前
+            # 0x02 推流帧和 0x03 轮询应答都是「数据帧」：统计口径一致，
+            # 轮询模式下运行统计的「连续帧」才不会永远是 0。
+            self.stream_count += 1
             if self.wave and ts <= self.wave[-1][0]:
                 # 时间戳必须严格递增（bisect 依赖）。兜底也保持等间隔——
-                # 老版本的 +1e-6 会把点画成竖条。
+                # 老版本的 +1e-6 会把点画成竖条；挤成 0.05 拍同样是竖条。
                 ts = self.wave[-1][0] + self.sample_dt
                 if ts > now + self.TS_AHEAD:
-                    # 缓冲尾部已经在未来（时钟基准坏过一次）：这里只保证单调，
-                    # 用很小的步长挤过去，让本机时间自己追上来。否则每帧都按
-                    # 整拍往前推，超前的雪球会越滚越大。
-                    ts = self.wave[-1][0] + self.sample_dt * 0.05
-                    self._dev_t = now
+                    # 缓冲尾部已经在未来（大批到达把推算时钟顶过了 TS_AHEAD）：
+                    # 保持整拍间隔，同时把设备时钟挂到尾部，让后面的帧继续
+                    # 等间隔推进。超前量不会滚雪球 —— 每帧只 +sample_dt，而
+                    # 等间隔分支里 |now-_dev_t|>0.4s 会整体重锚，超前最多 0.4s。
+                    # （跨「停止→开始」空洞造成的 sample_dt 高估由
+                    #   _break_stream_clock 在起停时重锚，不在这里处理。）
+                    self._dev_t = ts
             self.latest = vals
             self.push_count += 1
             if frame.cmd == CMD_START:
-                self._tune_rate(now)                   # 实测节拍，修正 sample_dt
+                # 只有 0x02 推流帧能校节拍（节拍是设备定的）；0x03 轮询应答的
+                # 节奏是主机自己定的 50ms，拿去校会把 sample_dt 带偏。
+                self._tune_rate(now)               # 实测节拍，修正 sample_dt
             self.wave.append((ts, vals))
             # 攒够一批再裁，别每帧都搬一次列表
             if len(self.wave) >= self.WAVE_MAX + self.WAVE_SLACK:
                 del self.wave[:len(self.wave) - self.WAVE_MAX]
             if self.log_raw and self.log_stream_every and \
                     self.push_count % self.log_stream_every == 0:
-                self._log("rx", f"← {hexs(frame.raw)}   [推流帧 #{self.push_count}]")
+                kind = "推流帧" if frame.cmd == CMD_START else "轮询应答帧"
+                self._log("rx", f"← {hexs(frame.raw)}   [{kind} #{self.push_count}]")
             if self.on_push is not None:
                 try:
                     self.on_push(vals, ts)
@@ -1205,17 +1224,76 @@ class Y75Client:
     #  具体命令
     # ------------------------------------------------------------------
     def stop(self) -> None:
+        self._stop_polling()
         try:
             self._transact(CMD_STOP, "ack", timeout=1.0)
         finally:
             # 超时也一样要重锚：命令可能已经到了设备，流真的停了
             self._break_stream_clock()
 
-    def start(self) -> None:
-        try:
-            self._transact(CMD_START, "ack", timeout=1.0)
-        finally:
+    def start(self, interval: float = POLL_INTERVAL) -> None:
+        """
+        开始连续采集（轮询模式）：每 interval 秒（默认 50ms）发一条 0x03，
+        设备逐条回一帧数据；点「停止」即停发轮询。
+
+        不再发送 0x02 推流命令 —— 主机不打开设备的连续发送，总线由主机主导，
+        设备只在被询问时说话，天然不会撞车。
+        """
+        if not self.is_connected():
+            raise Y75Error("设备未连接")
+        with self._poll_lock:
+            if self._poll_thread is not None and self._poll_thread.is_alive():
+                return                          # 已在轮询：重复点击是 no-op
             self._break_stream_clock()
+            self._poll_stop.clear()
+            self._poll_thread = threading.Thread(
+                target=self._poll_loop, args=(float(interval),),
+                name="y75-poll", daemon=True)
+            self._poll_thread.start()
+
+    def is_polling(self) -> bool:
+        th = self._poll_thread
+        return th is not None and th.is_alive()
+
+    def _stop_polling(self) -> None:
+        with self._poll_lock:
+            self._poll_stop.set()
+            th = self._poll_thread
+        if th is not None and th.is_alive() and th is not threading.current_thread():
+            th.join(timeout=1.5)
+        with self._poll_lock:
+            if self._poll_thread is th:
+                self._poll_thread = None
+
+    def _poll_loop(self, interval: float) -> None:
+        """
+        轮询节拍：从「上一次发」起算固定间隔，单次应答（毫秒级）不会累积漂移。
+        所有命令共用 _cmd_lock，手动命令只会让某一拍顺延，不会抢 waiter。
+        """
+        misses = 0
+        while not self._poll_stop.is_set():
+            if not self.is_connected():
+                break
+            t0 = time.monotonic()
+            try:
+                self.single(timeout=0.45)
+                misses = 0
+            except Y75Timeout:
+                misses += 1
+                if misses in (1, 10) or misses % 50 == 0:
+                    self._log("tx", f"0x03 轮询已 {misses} 次没等到数据帧"
+                                    f"（设备无应答？）")
+            except Y75Error as exc:
+                if not self._poll_stop.is_set():
+                    self._log("err", f"轮询中断：{exc}")
+                break
+            except Exception as exc:            # noqa: BLE001
+                if not self._poll_stop.is_set():
+                    self._log("err", f"轮询异常退出：{exc}")
+                break
+            delay = interval - (time.monotonic() - t0)
+            if delay > 0 and self._poll_stop.wait(delay):
+                break
 
     def _break_stream_clock(self) -> None:
         """

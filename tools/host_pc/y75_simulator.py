@@ -207,8 +207,14 @@ class Device:
         if cmd == CMD_SINGLE:
             with self.lock:
                 self.send_mode = 2
+                self.seq += 1
+                drop = bool(self.short_every) and self.seq % self.short_every == 0
             self.log("收到 0x03 单次采集 → 直接回一帧数据帧")
-            return [self.push_frame(CMD_SINGLE)]
+            out = [self.push_frame(CMD_SINGLE)]
+            if drop:
+                # 轮询模式下畸形帧也得有来源：应答前先塞一个空载荷短帧
+                out.insert(0, SHORT_FRAME)
+            return out
 
         # ---- 0x04 设置波特率（载荷由 handle_payload 处理，这里只管空载荷） ----
         if cmd == CMD_SET_BAUD:

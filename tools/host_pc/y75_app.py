@@ -65,6 +65,18 @@ LEVEL_COLOR = {"info": TXT_DIM, "tx": ACCENT, "rx": "#2f9e5f",
 #: 保存数据写出的 Excel 表头，顺序固定
 SAVE_HEADERS = AXIS_NAMES
 
+
+def axis_units(base: str) -> Tuple[str, ...]:
+    """按通道给显示单位：0-2 是力（FX/FY/FZ），3-5 是力矩（TX/TY/TZ）。
+
+    力矩的量纲是 力 × 长度：N → N·m，kg → kg·m；mV 等原始量纲六路一致。
+    """
+    if base == "N":
+        return ("N", "N", "N", "N·m", "N·m", "N·m")
+    if base == "kg":
+        return ("kg", "kg", "kg", "kg·m", "kg·m", "kg·m")
+    return (base,) * 6
+
 #: 连接方式
 MODE_SERIAL = "串口 (RS485)"
 MODE_TCP = "网络模拟 (TCP)"
@@ -501,10 +513,12 @@ class WaveCanvas(tk.Canvas):
                 self.itemconfigure(tx, text=f"{rel:+.1f}s")
 
         x = pad_l + 10
+        units = axis_units(self.unit)
         for i in range(6):
             self.coords(it["lgbox"][i], x, pad_t + 7, x + 11, pad_t + 17)
             self.coords(it["lgtext"][i], x + 16, pad_t + 12)
-            self.itemconfigure(it["lgtext"][i], text=f"{AXIS_NAMES[i]} ({self.unit})")
+            self.itemconfigure(it["lgtext"][i],
+                               text=f"{AXIS_NAMES[i]} ({units[i]})")
             x += 82
 
     def _set_ylabels(self, lo: float, hi: float) -> None:
@@ -1232,7 +1246,8 @@ class App:
             head.pack(fill="x", padx=9, pady=(7, 0))
             tk.Label(head, text=name, bg=CARD, fg=COLORS[i],
                      font=(self.font, 10, "bold")).pack(side="left")
-            unit = tk.Label(head, text="N", bg=CARD, fg=TXT_DIM, font=(self.font, 8))
+            unit = tk.Label(head, text=axis_units("N")[i], bg=CARD, fg=TXT_DIM,
+                            font=(self.font, 8))
             unit.pack(side="right")
             val = tk.Label(card, text="—", bg=CARD, fg=TXT, anchor="e",
                            font=("Consolas" if sys.platform.startswith("win") else "TkFixedFont",
@@ -1711,11 +1726,15 @@ class App:
         self.info_labels["ver"].configure(text=info.get("ver") or "—")
         st = info.get("status")
         if st:
-            self.send_mode = int(st["send_mode"])
+            # 轮询模式下设备报告的是「单次」(send_mode=2)，但主机侧语义是
+            # 「正在连续取数」——host 状态以轮询线程为准，别被设备状态盖掉。
+            polling = bool(self.cli and self.cli.is_polling())
+            self.send_mode = 1 if polling else int(st["send_mode"])
             self.data_format = int(st["data_format"])
             unit = FORMAT_UNIT.get(self.data_format, "")
+            mode_txt = "连续采集（轮询）" if polling else st["send_mode_text"]
             self.info_labels["state"].configure(
-                text=f"{st['send_mode_text']} · {st['data_format_text']} · "
+                text=f"{mode_txt} · {st['data_format_text']} · "
                      f"{st['freq_hz']}Hz · {st['debug_mode_text']}")
             self.info_labels["err"].configure(text=f"{st['comm_error']}")
             self.freq_var.set(str(st["freq_hz"]))
@@ -1730,14 +1749,16 @@ class App:
             self.info_labels["err"].configure(text="—")
 
     def _set_units(self, unit: str) -> None:
-        for _v, u in self.cards:
-            u.configure(text=unit or "N")
+        units = axis_units(unit or "N")
+        for (_v, u), txt in zip(self.cards, units):
+            u.configure(text=txt)
         self.wave.unit = unit or "N"
 
     def on_start(self) -> None:
         def done(_res):
             self.send_mode = 1
-            self._log_ui("info", "已开始连续采集")
+            self._log_ui("info", "已开始连续采集（每 50 ms 发一条 0x03 轮询，"
+                                 "点「停止」即停发）")
         self._run_async(lambda: self.cli.start(), done, "开始连续采集")
 
     def on_stop(self) -> None:
@@ -1792,7 +1813,9 @@ class App:
             return cli.query_status()
 
         def done(st):
-            self.send_mode = int(st["send_mode"])
+            # 轮询进行中时设备状态是「单次」，别用它覆盖主机的连续采集标记
+            if not (self.cli and self.cli.is_polling()):
+                self.send_mode = int(st["send_mode"])
             self.data_format = int(st["data_format"])
             self._set_units(FORMAT_UNIT.get(self.data_format, ""))
             self._log_ui("info", f"输出设置已生效：{st['data_format_text']} · "
