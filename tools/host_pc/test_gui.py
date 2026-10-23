@@ -30,6 +30,7 @@ sys.path.insert(0, HERE)
 
 import tkinter as tk                                            # noqa: E402
 from argparse import Namespace                                  # noqa: E402
+from tkinter import messagebox                                  # noqa: E402
 
 from y75_app import (MODE_TCP, OUT_ASC, OUT_HEX, SPAN_PTS_CHOICES,  # noqa: E402
                      SPAN_SEC_CHOICES, X_MODE_PTS_LABEL, X_MODE_TIME_LABEL,
@@ -305,6 +306,65 @@ def test_matrix(root: tk.Tk, app: App) -> None:
     check("复制到剪贴板不报错", _no_raise(app._copy_matrix))
 
 
+def test_sn_tab(root: tk.Tk, app: App) -> None:
+    section("4b. 序列号选项卡（0x0A 写 / 0x05 读）")
+    names = [app.nb.tab(t, "text") for t in app.nb.tabs()]
+    check("选项卡顺序：波形 / 矩阵 / 报文日志 / 序列号",
+          names == ["实时波形", "解耦矩阵", "报文日志", "序列号"], " | ".join(names))
+
+    app.nb.select(len(names) - 1)
+    root.update()
+
+    app.on_read_sn()
+    check("读取序列号完成", wait_idle(root, app))
+    sn0 = app.sn_now.cget("text")
+    check("当前序列号已显示", bool(sn0) and sn0 != "—", sn0)
+    check("与顶部信息栏同一口径",
+          app.info_labels["sn"].cget("text") == sn0,
+          app.info_labels["sn"].cget("text"))
+
+    # ---- 输入时实时校验 ----
+    app.sn_var.set("A" * 16)
+    root.update()
+    check("超长时禁用「写入设备」", "disabled" in app.btn_sn_write.state())
+    check("超长时计数变红", app.sn_count.cget("text") == "16/15",
+          app.sn_count.cget("text"))
+    app.sn_var.set("HS 001")
+    root.update()
+    check("含空格时禁用写入并说明原因",
+          "disabled" in app.btn_sn_write.state()
+          and "0x20" in app.sn_hint.cget("text"), app.sn_hint.cget("text"))
+    app.sn_var.set("HS-001")
+    root.update()
+    check("合法值重新启用写入", "disabled" not in app.btn_sn_write.state())
+    check("合法值计数 6/15", app.sn_count.cget("text") == "6/15",
+          app.sn_count.cget("text"))
+
+    # ---- 真写一次（跳过确认框）----
+    orig_ask = messagebox.askyesno
+    messagebox.askyesno = lambda *a, **k: True
+    try:
+        app.on_write_sn()
+        check("写入完成", wait_idle(root, app))
+    finally:
+        messagebox.askyesno = orig_ask
+    check("写入后当前值更新", app.sn_now.cget("text") == "HS-001",
+          app.sn_now.cget("text"))
+    check("写入后顶部信息栏一起更新",
+          app.info_labels["sn"].cget("text") == "HS-001")
+    check("写入后输入框清空", app.sn_var.get() == "", repr(app.sn_var.get()))
+    check("提示里写明已回读确认", "回读" in app.sn_hint.cget("text"),
+          app.sn_hint.cget("text"))
+    check("设备里确实是新值", app.cli.query_sn() == "HS-001", app.cli.query_sn())
+
+    # ---- 收尾：把设备的序列号写回去 ----
+    app.sn_var.set(sn0)
+    root.update()
+    app.on_write_sn()
+    wait_idle(root, app)
+    check("收尾恢复原序列号", app.cli.query_sn() == sn0, app.cli.query_sn())
+
+
 def test_save(root: tk.Tk, app: App, tmpdir: str) -> None:
     section("5. 保存数据到 Excel")
     path = os.path.join(tmpdir, "save_test.xlsx")
@@ -436,8 +496,8 @@ def test_layout(root: tk.Tk, app: App) -> None:
 
     check("六个数值卡片都可见",
           all(c[0].winfo_exists() for c in app.cards))
-    check("三个页签都在",
-          app.nb.index("end") == 3, f"{app.nb.index('end')} 个页签")
+    check("四个页签都在（波形 / 矩阵 / 报文日志 / 序列号）",
+          app.nb.index("end") == 4, f"{app.nb.index('end')} 个页签")
     root.withdraw()
     root.update()
 
@@ -861,6 +921,7 @@ def main() -> int:
         test_bus_panel(root, app)
         test_single_and_settings(root, app)
         test_matrix(root, app)
+        test_sn_tab(root, app)
         test_save(root, app, tmpdir)
         test_layout(root, app)
         test_wave_decoupled(root, app)

@@ -136,6 +136,37 @@ static void data_format_save(uint8_t fmt)
     at24c04_write(DATA_FORMAT_ADDR, &v, 1);
 }
 
+/* Persist a new serial number (command 0x0A).  Returns one of RS485_SN_*.
+   The number lives in one AT24C04 page at SN_ADDR: up to SN_MAX_LEN
+   printable ASCII chars, NUL terminated, the rest padded with 0xFF so a
+   blank EEPROM and a short SN are told apart on boot.  main() reads it
+   back into g_config.sn, which is what 0x05 answers with. */
+static uint8_t sn_store(const uint8_t *src, uint16_t len)
+{
+    uint8_t  ee[SN_MAX_LEN + 1];
+    uint16_t i;
+
+    if (len < 1U || len > SN_MAX_LEN) {
+        return RS485_SN_ERR_FORMAT;
+    }
+    for (i = 0; i < len; i++) {
+        if (src[i] < 0x20U || src[i] > 0x7EU) {   /* printable ASCII only */
+            return RS485_SN_ERR_FORMAT;
+        }
+    }
+
+    memset(ee, 0xFF, sizeof(ee));
+    memcpy(ee, src, len);
+    ee[len] = '\0';
+
+    if (at24c04_write(SN_ADDR, ee, sizeof(ee)) != HAL_OK) {
+        return RS485_SN_ERR_WRITE;
+    }
+
+    memcpy(g_config.sn, ee, sizeof(ee));          /* keep the RAM copy in sync */
+    return RS485_SN_OK;
+}
+
 /* Apply a new baud rate: save it to EEPROM, then re-init USART1 and restart
  * DMA reception.  Must be called AFTER the ACK has been transmitted so the
  * host can still read the response at the old baud rate. */
@@ -285,6 +316,15 @@ void rs485_cmd_dispatch(uint8_t cmd, const uint8_t *payload, uint16_t len)
     /* ---- 0x05  Query serial number ---- */
     case RS485_CMD_QUERY_SN:
         original_send((const uint8_t *)g_config.sn, (uint16_t)strlen(g_config.sn));
+        break;
+
+    /* ---- 0x0A  Write serial number: AA 55 0A [ASCII 1..15] 0D 0A ----
+       Reply AA 55 8A [status] 0D 0A.  A status byte (instead of a bare
+       ACK) lets the host tell "device rejected it" from "device never
+       answered" — the latter means an old firmware without 0x0A. */
+    case RS485_CMD_SET_SN:
+        buf[0] = sn_store(payload, len);
+        respond(cmd, buf, 1);
         break;
 
     /* ---- 0x06  Query firmware version ---- */

@@ -68,7 +68,7 @@ volatile sensor_data_t   g_sensor;
 volatile system_state_t  g_sys;
 config_t                 g_config = {
     .sn         = "HS-01234567",
-    .fw_version = 0x00010703,
+    .fw_version = 0x00010704,     /* V1.7.4：新增 0x0A 写序列号（存 EEPROM 0xB0） */
 };
 decouple_matrix_t        g_matrix;
 
@@ -314,6 +314,26 @@ int main(void)
 
         at24c04_read(DATA_FORMAT_ADDR, &fmt, 1);
         g_sys.data_format = (fmt == 1 || fmt == 2) ? fmt : 2;
+    }
+
+    /* Restore the serial number written by 0x0A.  A blank EEPROM reads
+       back as 0xFF; anything with a non-printable byte is treated as
+       corrupt.  Both fall back to the compile-time default in g_config,
+       so a bad page can never leave the device without an SN. */
+    {
+        uint8_t sn_buf[SN_MAX_LEN + 1];
+        uint8_t n = 0, ok = 1;
+
+        at24c04_read(SN_ADDR, sn_buf, sizeof(sn_buf));
+        while (n < SN_MAX_LEN &&
+               sn_buf[n] != '\0' && sn_buf[n] != 0xFF) {
+            if (sn_buf[n] < 0x20U || sn_buf[n] > 0x7EU) { ok = 0; break; }
+            n++;
+        }
+        if (ok && n > 0U) {
+            memcpy(g_config.sn, sn_buf, n);
+            g_config.sn[n] = '\0';
+        }
     }
 
     HAL_TIM_Base_Start_IT(&htim2);   /* Start 1kHz timer */

@@ -22,6 +22,7 @@ extern "C" {
 #define RS485_CMD_QUERY_VER     0x06  /* Query firmware version              */
 #define RS485_CMD_QUERY_STATUS  0x07  /* Query system status                 */
 #define RS485_CMD_SET_FREQ      0x08  /* Set frequency: 0=500Hz, 1=1000Hz    */
+#define RS485_CMD_SET_SN        0x0A  /* Write serial number: ASCII 1..15     */
 #define RS485_CMD_ZERO          0x30  /* Zero calibration (set offsets)      */
 #define RS485_CMD_UNZERO        0x36  /* Cancel zero (clear offsets)         */
 #define RS485_CMD_QUERY_MATRIX  0x37  /* Query the 6×6 matrix (144 bytes)    */
@@ -32,8 +33,6 @@ extern "C" {
 #define RS485_CMD_SET_FORMAT    0x34  /* Set data format: 0=mV,1=kg,2=N      */
 #define RS485_CMD_SET_FORMAT_N  0x35  /* Set data format: 0=mV,1=kg,2=N      */
 
-#define ETHERCAT_DISABLED       0x40
-#define ETHERCAT_ENABLED        0x41
 #define RS485_CMD_SET_IP        0x0B  /* Set IP address   (4 bytes)          */
 #define RS485_CMD_SET_MAC       0x0C  /* Set MAC address  (6 bytes)          */
 #define RS485_CMD_SET_SUBNET    0x0D  /* Set subnet mask  (4 bytes)          */
@@ -57,6 +56,13 @@ extern "C" {
 
 /** @name Response flag (OR-ed with command code in response frame) */
 #define RS485_RESP_FLAG         0x80  /* AA 55 [CMD|0x80] [DATA] 0D 0A       */
+
+/** @name Status byte of the 0x0A (write SN) reply: AA 55 8A [status] 0D 0A */
+/*@{*/
+#define RS485_SN_OK             0x00  /* stored; survives a power cycle      */
+#define RS485_SN_ERR_FORMAT     0x01  /* length not 1..15, or non-printable  */
+#define RS485_SN_ERR_WRITE      0x02  /* EEPROM write failed                 */
+/*@}*/
 
 /**
  * Send one data frame carrying the current 6-axis values.

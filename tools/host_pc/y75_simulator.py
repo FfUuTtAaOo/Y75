@@ -36,9 +36,10 @@ from y75_protocol import (
     CMD_QUERY_STATUS, CMD_QUERY_UNIT,
     CMD_QUERY_VER,
     CMD_SET_BAUD,
-    CMD_SET_FREQ, CMD_SET_KG, CMD_SET_MATRIX, CMD_SET_MV, CMD_SET_N, CMD_SINGLE,
-    CMD_START, CMD_STOP, CMD_UNZERO, CMD_ZERO, EOF, RESP_FLAG, SOF, dump_matrix,
-    frame_text, hexs,
+    CMD_SET_FREQ, CMD_SET_KG, CMD_SET_MATRIX, CMD_SET_MV, CMD_SET_N, CMD_SET_SN,
+    CMD_SINGLE,
+    CMD_START, CMD_STOP, CMD_UNZERO, CMD_ZERO, EOF, RESP_FLAG, SN_ERR_FORMAT,
+    SN_MAX_LEN, SN_OK, SOF, dump_matrix, frame_text, hexs,
 )
 
 #: 六路出厂级信号：幅度、频率、相位、偏置（模拟一点真实的耦合与漂移）
@@ -344,6 +345,23 @@ class Device:
                 return None
             self.log(f"0x04 设置波特率 → {baud} bps，先按旧波特率回 ACK")
             return None if cmd in self.no_ack else [self.ack(cmd)]
+
+        if cmd == CMD_SET_SN:
+            # 0x0A 写序列号：ASCII 1..15 字节，存 EEPROM 0xB0（掉电保持）。
+            # 真机用状态字节回：00 已存 / 01 内容非法 / 02 写失败。
+            body = payload or b""
+            bad_len = not (1 <= len(body) <= SN_MAX_LEN)
+            bad_chr = any(c < 0x20 or c > 0x7E for c in body)
+            if bad_len or bad_chr:
+                self.comm_error = (self.comm_error + 1) & 0xFFFF
+                why = f"长度 {len(body)}" if bad_len else "含非可打印字符"
+                self.log(f"0x0A 写序列号被拒（{why}）→ 回状态 01")
+                return None if cmd in self.no_ack else \
+                    [self.ack(cmd, bytes((SN_ERR_FORMAT,)))]
+            with self.lock:
+                self.sn = body.decode("ascii")
+            self.log(f"0x0A 写序列号 → {self.sn!r}（存 EEPROM 0xB0，掉电保持）")
+            return None if cmd in self.no_ack else [self.ack(cmd, bytes((SN_OK,)))]
 
         if cmd == CMD_SET_FREQ:
             mode = 0 if (payload and payload[0] == 0) else 1
@@ -719,6 +737,27 @@ def _selftest() -> int:                                  # pragma: no cover
 
     dev = Device(verbose=False, noise=0.0)
     check("0x05 回裸序列号", dev.handle(0x05) == [DEFAULT_SN.encode("ascii")])
+
+    # 0x0A 写序列号：状态字节 00/01，写完 0x05 要读得到新值
+    got = dev.handle_payload(0x0A, b"HS-2024.001")
+    check("0x0A 写序列号回 8A 00", got == [b"\xAA\x55\x8A\x00\x0D\x0A"],
+          hexs(got[0]) if got else "无回复")
+    check("0x0A 后 0x05 读回新值",
+          dev.handle(0x05) == [b"HS-2024.001"],
+          str(dev.handle(0x05)))
+    before = dev.comm_error
+    check("0x0A 超长被拒（状态 01）",
+          dev.handle_payload(0x0A, b"A" * 16) == [b"\xAA\x55\x8A\x01\x0D\x0A"]
+          and dev.comm_error == before + 1)
+    check("0x0A 空载荷被拒", dev.handle_payload(0x0A, b"") == [b"\xAA\x55\x8A\x01\x0D\x0A"])
+    check("0x0A 非可打印字符被拒",
+          dev.handle_payload(0x0A, b"HS\x01") == [b"\xAA\x55\x8A\x01\x0D\x0A"])
+    check("0x0A 被拒后序列号没变", dev.handle(0x05) == [b"HS-2024.001"])
+    check("0x0A 15 位边界可用",
+          dev.handle_payload(0x0A, b"B" * 15) == [b"\xAA\x55\x8A\x00\x0D\x0A"]
+          and dev.handle(0x05) == [b"B" * 15])
+    dev.handle_payload(0x0A, DEFAULT_SN.encode("ascii"))     # 还原，后面还用
+
     check("0x06 回 3 字节版本",
           dev.handle(0x06)[0] == b"\xAA\x55\x86\x01\x07\x02\x0D\x0A",
           hexs(dev.handle(0x06)[0]))

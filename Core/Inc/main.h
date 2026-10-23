@@ -76,6 +76,12 @@ void uart_debug(const char *msg);
 /* EEPROM address holding the 1-byte data output unit (1 = kg, 2 = N) */
 #define DATA_FORMAT_ADDR      0x7C
 
+/* EEPROM address holding the device serial number: 16 bytes (NUL padded,
+   0xFF when blank).  0xB0..0xBF is exactly one AT24C04 page and sits right
+   after the zero offsets (0x98..0xAF), so a write never straddles a page. */
+#define SN_ADDR               0xB0
+#define SN_MAX_LEN            15      /* excluding the terminating NUL */
+
 #define UART_BUFFER_SIZE 64
 
 #define U32_TO_U8(u32, u8, offset)  (u8) = (((u32) >> (offset)) & 0xFF)

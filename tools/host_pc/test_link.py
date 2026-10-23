@@ -42,9 +42,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from y75_protocol import (  # noqa: E402
-    ASC_FRAME_LEN, ASC_SENTINEL, ByteOrder, BusGate, CMD_QUERY_MATRIX, CMD_START,
-    CMD_STOP, EOF, SOF, TcpTransport, Y75Client, Y75Error, Y75Timeout, build_cmd,
-    dump_matrix, fmt_value, hexs, parse_matrix_text,
+    ASC_FRAME_LEN, ASC_SENTINEL, ByteOrder, BusGate, CMD_QUERY_MATRIX,
+    CMD_SET_SN, CMD_START, CMD_STOP, EOF, SOF, TcpTransport, Y75Client,
+    Y75Error, Y75Timeout, build_cmd, dump_matrix, fmt_value, hexs,
+    parse_matrix_text,
 )
 
 PASS = FAIL = 0
@@ -412,6 +413,57 @@ def test_matrix(cli: Y75Client) -> None:
         except Y75Error:
             bad += 1
     check("非法行号/长度在上位机侧就被拦下", bad == 2, f"{bad}/2")
+
+
+def test_sn(cli: Y75Client) -> None:
+    section("5b. 序列号（0x0A 写 / 0x05 读）")
+    orig = cli.query_sn()
+    check("起始序列号可读", bool(orig), repr(orig))
+
+    # ---- 线上字节：AA 55 0A [ASCII] 0D 0A ----
+    sent: List[bytes] = []
+    tx = cli.transport
+    orig_write = tx.write
+
+    def tap(data: bytes) -> None:
+        sent.append(bytes(data))
+        orig_write(data)
+
+    tx.write = tap                                    # type: ignore[method-assign]
+    try:
+        got = cli.set_sn("T-0001")
+    finally:
+        tx.write = orig_write                         # type: ignore[method-assign]
+    fr = next((b for b in sent if b[:3] == b"\xAA\x55\x0A"), None)
+    check("0x0A 帧 = AA 55 0A 'T-0001' 0D 0A",
+          fr == b"\xAA\x55\x0A" + b"T-0001" + b"\x0D\x0A",
+          hexs(fr) if fr else "没抓到 0x0A 帧")
+    check("写后回读 = 写入值", got == "T-0001" and cli.query_sn() == "T-0001", got)
+
+    got = cli.set_sn("  AB-9  ")
+    check("首尾空白自动去掉（不把空格写进设备）", got == "AB-9", repr(got))
+
+    # ---- 设备侧拒绝：绕过上位机校验，直接发 16 字节 ----
+    f = cli._transact(CMD_SET_SN, "snack", b"A" * 16)
+    st = f.payload[0] if (f is not None and f.payload) else None
+    check("16 字节载荷被设备拒绝（回了 8A 01）", st == 0x01,
+          f"状态 0x{st:02X}" if st is not None else "没收到状态字节")
+    check("被拒后序列号没变", cli.query_sn() == "AB-9", cli.query_sn())
+
+    # ---- 上位机侧拦截：非法输入一帧都不该发出去 ----
+    n_before = len(sent)
+    blocked = 0
+    for bad in ("", "A" * 16, "HS 001", "HS@1"):
+        try:
+            cli.set_sn(bad)
+        except Y75Error:
+            blocked += 1
+    check("空/超长/带空格/特殊字符在上位机侧拦下", blocked == 4, f"{blocked}/4")
+    check("被拦下的输入没有占用总线", len(sent) == n_before,
+          f"{len(sent)} vs {n_before}")
+
+    cli.set_sn(orig)
+    check("收尾恢复原始序列号", cli.query_sn() == orig, cli.query_sn())
 
 
 def test_zero(cli: Y75Client) -> None:
@@ -862,6 +914,7 @@ def main() -> int:
         test_stream_clock(cli)
         test_freq_and_format(cli)
         test_matrix(cli)
+        test_sn(cli)
         test_zero(cli)
         test_sticky_frames(host, port)
         test_bad_frames(host, port)

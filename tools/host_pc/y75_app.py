@@ -16,7 +16,7 @@ y75_app.py —— Y75 六维力传感器 上位机（tkinter，纯标准库）
 界面速览：
     左栏      连接 / 设备信息 / 采集控制 / 输出设置 / 零点
     右上      六个通道的大号数值卡片（无数据时显示「—」）
-    右中      实时波形 | 解耦矩阵 | 报文日志
+    右中      实时波形 | 解耦矩阵 | 报文日志 | 序列号
     底栏      运行日志 + 开始/停止保存数据到 Excel
 """
 
@@ -40,8 +40,8 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 from y75_protocol import (                                     # noqa: E402
-    AXIS_NAMES, BAUD_CHOICES, ByteOrder, FORMAT_UNIT, TcpTransport, Y75Client,
-    Y75Error, Y75Timeout, fmt_value,
+    AXIS_NAMES, BAUD_CHOICES, ByteOrder, FORMAT_UNIT, SN_MAX_LEN, TcpTransport,
+    Y75Client, Y75Error, Y75Timeout, check_sn, fmt_value,
 )
 from y75_serial import SerialPort, SerialError, list_ports     # noqa: E402
 from y75_xlsx import XlsxLimitError, XlsxTableWriter           # noqa: E402
@@ -854,6 +854,7 @@ class App:
         self.send_mode = 0
         self.data_format = 1
         self.tx_warned = False
+        self.sn_pending = False           # 正在写序列号（失败时要把提示写回本页）
         self._auto_started = False        # --autoconnect 只用一次
         self._tick_n = 0                  # tick 计数，用来给数字显示降频
         self._skipped_logs = 0            # 因限流被合并的日志条数
@@ -1385,6 +1386,63 @@ class App:
         self.raw_text = self.raw_frame.text
         self.raw_frame.grid(row=1, column=0, sticky="nsew")
 
+        # ---- 序列号（0x0A 写 / 0x05 读）----
+        tab = ttk.Frame(nb, padding=12)
+        nb.add(tab, text="序列号")
+        tab.columnconfigure(0, weight=1)
+
+        mono = "Consolas" if sys.platform.startswith("win") else "TkFixedFont"
+        tk.Label(tab, text="设备序列号", bg=BG, fg=TXT,
+                 font=(self.font, 11, "bold")).grid(row=0, column=0, sticky="w")
+
+        cur = tk.Frame(tab, bg=BG)
+        cur.grid(row=1, column=0, sticky="w", pady=(8, 0))
+        tk.Label(cur, text="当前：", bg=BG, fg=TXT_DIM,
+                 font=(self.font, 9)).pack(side="left")
+        self.sn_now = tk.Label(cur, text="—", bg=BG, fg=TXT,
+                               font=(mono, int(13 * max(1.0, self.scale)), "bold"))
+        self.sn_now.pack(side="left")
+        ttk.Button(cur, text="读取", width=6,
+                   command=self.on_read_sn).pack(side="left", padx=(12, 0))
+        self.sn_ver_hint = tk.Label(cur, text="", bg=BG, fg=TXT_DIM,
+                                    font=(self.font, 8))
+        self.sn_ver_hint.pack(side="left", padx=(10, 0))
+
+        ttk.Separator(tab, orient="horizontal").grid(
+            row=2, column=0, sticky="ew", pady=(14, 0))
+
+        wr = tk.Frame(tab, bg=BG)
+        wr.grid(row=3, column=0, sticky="w", pady=(14, 0))
+        tk.Label(wr, text="新序列号：", bg=BG, fg=TXT_DIM,
+                 font=(self.font, 9)).pack(side="left")
+        self.sn_var = tk.StringVar(value="")
+        self.sn_entry = tk.Entry(wr, textvariable=self.sn_var, width=22,
+                                 font=(mono, int(11 * max(1.0, self.scale))),
+                                 bg=CARD, fg=TXT, relief="solid", bd=1,
+                                 highlightthickness=0, insertbackground=TXT)
+        self.sn_entry.pack(side="left", padx=(4, 0), ipady=2)
+        self.sn_count = tk.Label(wr, text=f"0/{SN_MAX_LEN}", bg=BG, fg=TXT_DIM,
+                                 font=(self.font, 8))
+        self.sn_count.pack(side="left", padx=(8, 0))
+        self.sn_var.trace_add("write", lambda *_: self._on_sn_edit())
+
+        bb = tk.Frame(tab, bg=BG)
+        bb.grid(row=4, column=0, sticky="w", pady=(10, 0))
+        self.btn_sn_write = ttk.Button(bb, text="写入设备", command=self.on_write_sn)
+        self.btn_sn_write.pack(side="left")
+        ttk.Button(bb, text="清空", width=6,
+                   command=lambda: self.sn_var.set("")).pack(side="left", padx=(6, 0))
+
+        self.sn_hint = tk.Label(tab, text="", bg=BG, fg=TXT_DIM, anchor="w",
+                                justify="left", font=(self.font, 8))
+        self.sn_hint.grid(row=5, column=0, sticky="w", pady=(10, 0))
+        tk.Label(tab, text=f"规则：{SN_MAX_LEN} 位以内的字母、数字和 - _ .；"
+                           "写进设备 EEPROM，掉电保持；写完自动回读校验。\n"
+                           "需要固件 V1.7.4 及以上（0x0A 写序列号命令）。",
+                 bg=BG, fg=TXT_DIM, anchor="w", justify="left",
+                 font=(self.font, 8)).grid(row=6, column=0, sticky="w", pady=(4, 0))
+        self._on_sn_edit()
+
     # ------------------------------------------------------------------
     def _build_bottom(self, root: tk.Tk) -> None:
         bar = tk.Frame(root, bg=CARD, highlightthickness=1, highlightbackground=EDGE)
@@ -1673,6 +1731,15 @@ class App:
             self._log_ui("err", str(exc))
         else:
             self._log_ui("err", f"{type(exc).__name__}: {exc}")
+        if self.sn_pending:
+            # 写序列号失败：把原因写回「序列号」页，别让那行提示停在「正在写入…」
+            self.sn_pending = False
+            if isinstance(exc, Y75Timeout):
+                msg = (f"写入超时：{exc}。如果设备版本低于 V1.7.4，"
+                       "固件没有 0x0A 写序列号命令，只会超时。")
+            else:
+                msg = f"写入失败：{exc}"
+            self.sn_hint.configure(text=msg, fg=LEVEL_COLOR["err"])
 
     def _warn_timeout_once(self) -> None:
         if self.tx_warned:
@@ -1727,6 +1794,19 @@ class App:
 
     def _apply_info(self, info: dict) -> None:
         self.info_labels["sn"].configure(text=info.get("sn") or "—")
+        # 「序列号」页的当前值跟顶部信息栏保持同一口径
+        if getattr(self, "sn_now", None) is not None:
+            self.sn_now.configure(text=info.get("sn") or "—")
+        # 顺便提示固件支不支持 0x0A 写序列号（V1.7.4 起才有）
+        ver = (info.get("ver") or "").strip()
+        if getattr(self, "sn_ver_hint", None) is not None and ver.startswith("V"):
+            nums = [int(x) for x in ver[1:].split(".") if x.isdigit()]
+            nums += [0] * (3 - len(nums))
+            ok = tuple(nums[:3]) >= (1, 7, 4)
+            self.sn_ver_hint.configure(
+                text=f"固件 {ver}：" + ("支持写序列号" if ok
+                                        else "不支持写序列号（需 V1.7.4+）"),
+                fg=TXT_DIM if ok else LEVEL_COLOR["err"])
         self.info_labels["ver"].configure(text=info.get("ver") or "—")
         st = info.get("status")
         if st:
@@ -1759,6 +1839,71 @@ class App:
                 if code == self.data_format:
                     self.fmt_var.set(name)
         self._set_units(FORMAT_UNIT.get(self.data_format, ""))
+
+    # ==================================================================
+    #  序列号（0x0A 写 / 0x05 读）
+    # ==================================================================
+    def _on_sn_edit(self) -> None:
+        """边打边校验：字数、字符集不合规立刻标红并禁用「写入」，别等点了才报错。"""
+        raw = self.sn_var.get()
+        self.sn_count.configure(text=f"{len(raw)}/{SN_MAX_LEN}")
+        try:
+            sn = check_sn(raw)
+        except Y75Error as exc:
+            if raw.strip():
+                self.sn_entry.configure(fg=LEVEL_COLOR["err"])
+                self.sn_count.configure(fg=LEVEL_COLOR["err"])
+                self.sn_hint.configure(text=str(exc), fg=LEVEL_COLOR["err"])
+            else:                       # 空着不算错，别一进页面就看到红的
+                self.sn_entry.configure(fg=TXT)
+                self.sn_count.configure(fg=TXT_DIM)
+                self.sn_hint.configure(text="", fg=TXT_DIM)
+            self.btn_sn_write.state(["disabled"])
+            return
+        self.sn_entry.configure(fg=TXT)
+        self.sn_count.configure(fg=LEVEL_COLOR["rx"])
+        self.sn_hint.configure(text=f"将写入：{sn}", fg=TXT_DIM)
+        self.btn_sn_write.state(["!disabled"])
+
+    def on_read_sn(self) -> None:
+        self._run_async(lambda: self.cli.query_sn(), self._apply_sn, "读取序列号")
+
+    def _apply_sn(self, sn: str) -> None:
+        got = (sn or "").strip()
+        self.sn_now.configure(text=got or "（设备没回内容）")
+        self.info_labels["sn"].configure(text=got or "—")
+        self.sn_hint.configure(text=f"读取成功：{got}" if got else "设备没返回内容",
+                               fg=TXT_DIM)
+        self._log_ui("info", f"序列号 = {got or '（空）'}")
+
+    def on_write_sn(self) -> None:
+        try:
+            sn = check_sn(self.sn_var.get())
+        except Y75Error as exc:
+            self._log_ui("err", str(exc))
+            self.sn_hint.configure(text=str(exc), fg=LEVEL_COLOR["err"])
+            return
+        if not messagebox.askyesno(
+                "写入序列号",
+                f"把设备序列号改成：\n\n        {sn}\n\n"
+                "这会覆盖设备 EEPROM 里原来的序列号（掉电保持，不可撤销）。"
+                "\n确定写入吗？", parent=self.root):
+            return
+        self.sn_pending = True
+        if not self._run_async(lambda: self.cli.set_sn(sn), self._after_write_sn,
+                              "写序列号"):
+            self.sn_pending = False
+            return
+        self.sn_hint.configure(text="正在写入并回读 …", fg=TXT_DIM)
+
+    def _after_write_sn(self, got: str) -> None:
+        self.sn_pending = False
+        self.sn_now.configure(text=got)
+        self.info_labels["sn"].configure(text=got)
+        self.sn_var.set("")                     # 清空输入框，避免重复写同一条
+        self.sn_hint.configure(text=f"[OK] 已写入并回读确认：{got}",
+                               fg=LEVEL_COLOR["rx"])
+        self._log_ui("info", f"序列号已写入：{got}（回读一致）")
 
     def _set_units(self, unit: str) -> None:
         units = axis_units(unit or "N")

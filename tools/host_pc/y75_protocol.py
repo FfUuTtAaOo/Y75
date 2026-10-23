@@ -70,6 +70,7 @@ CMD_QUERY_SN = 0x05
 CMD_QUERY_VER = 0x06
 CMD_QUERY_STATUS = 0x07
 CMD_SET_FREQ = 0x08
+CMD_SET_SN = 0x0A              # 写序列号：载荷 ASCII 1..15 字节，回 8A [状态]
 CMD_LED_ON = 0x0F              # 心跳灯闪烁（0x01 停止采集时同时熄灭）
 CMD_QUERY_UNIT = 0x0E          # 查询数据单位：回复最低位 1=kg 0=N
 CMD_SET_MATRIX = 0x20          # 上传解耦矩阵的某一行
@@ -97,6 +98,8 @@ COMMANDS: Dict[int, Tuple[str, str]] = {
     CMD_QUERY_VER:    ("查询固件版本", "回复 3 字节：主.次.修订"),
     CMD_QUERY_STATUS: ("查询运行状态", "回复 8 字节，见 parse_status()"),
     CMD_SET_FREQ:     ("设置输出频率", "载荷 1 字节：0=500Hz 1=1000Hz"),
+    CMD_SET_SN:       ("写序列号", "载荷 ASCII 1..15 字节，存 EEPROM；"
+                                   "回 8A [00=已存 01=内容非法 02=保存失败]"),
     CMD_LED_ON:       ("心跳灯闪烁", "设备回 ACK，PA12 以 1Hz 闪烁；0x01 熄灭"),
     CMD_QUERY_UNIT:   ("查询单位", "回复 1 字节：最低位 1=kg 0=N"),
     CMD_SET_MATRIX:   ("上传矩阵行", "载荷 = 行号 + 6×float32 **大端**，共 25 字节"),
@@ -235,6 +238,7 @@ _RESP_TABLE: Dict[int, Tuple[str, Optional[int]]] = {
     CMD_LED_ON:         ("ack", 0),          # 0x8F
     CMD_SET_BAUD:       ("ack", 0),          # 0x84
     CMD_SET_FREQ:       ("ack", 0),          # 0x88
+    CMD_SET_SN:         ("snack", 1),        # 0x8A + 1 字节状态（不是裸 ACK）
     CMD_ZERO:           ("ack", 0),          # 0xB0
     CMD_HEX_SEND:       ("ack", 0),          # 0xB1
     CMD_ASC_SEND:       ("ack", 0),          # 0xB2
@@ -522,6 +526,44 @@ class Y75Timeout(TimeoutError):
 
 class Y75Error(RuntimeError):
     """协议层错误。"""
+
+
+# =====================================================================
+#  序列号（0x0A 写 / 0x05 读）
+# =====================================================================
+#: 固件里 SN 存在 `char sn[16]`，所以最长 15 个字符（不含结尾 NUL）；
+#: 存 EEPROM 0xB0..0xBF 一整页，上电时由 main() 读回 g_config.sn。
+SN_MAX_LEN = 15
+SN_CHARS = frozenset("0123456789"
+                     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                     "abcdefghijklmnopqrstuvwxyz"
+                     "-_.")
+
+#: 0x0A 回复（AA 55 8A [状态] 0D 0A）里的状态字节，与固件 RS485_SN_* 对应
+SN_OK = 0x00
+SN_ERR_FORMAT = 0x01
+SN_ERR_WRITE = 0x02
+SN_STATUS_TEXT = {SN_OK: "已保存", SN_ERR_FORMAT: "内容非法", SN_ERR_WRITE: "保存失败"}
+
+
+def check_sn(text: str) -> str:
+    """
+    规范化并校验序列号，返回去掉首尾空白的值；不合法抛 Y75Error。
+
+    规则和固件 `sn_store()` 一一对应（长度 1..15、可打印 ASCII），
+    这样不会出现「界面放行、设备拒绝」的来回。
+    """
+    sn = (text or "").strip()
+    if not sn:
+        raise Y75Error("序列号不能为空")
+    if len(sn) > SN_MAX_LEN:
+        raise Y75Error(f"序列号最多 {SN_MAX_LEN} 位，当前 {len(sn)} 位")
+    bad = [c for c in sn if c not in SN_CHARS]
+    if bad:
+        # 用 16 进制码点报出来：空格、制表符这类看不见的字符也能定位
+        codes = " ".join(f"0x{ord(c):02X}" for c in dict.fromkeys(bad))
+        raise Y75Error(f"序列号只能含字母、数字和 - _ .，不接受字符：{codes}")
+    return sn
 
 
 class _Waiter:
@@ -1369,6 +1411,38 @@ class Y75Client:
         self._text_buf.clear()
         self._transact(CMD_QUERY_SN, "text", timeout=timeout, want_text=True)
         return self.text_log[-1].strip() if self.text_log else ""
+
+    def set_sn(self, sn: str, timeout: float = 3.0, verify: bool = True) -> str:
+        """
+        写序列号（0x0A）：载荷是 ASCII 原文（1..15 字节），设备存 EEPROM。
+
+        设备回的是 **AA 55 8A [状态] 0D 0A**，不是裸 ACK：
+        00 = 已保存，01 = 长度/字符非法，02 = EEPROM 写失败。有状态字节
+        才能把「设备拒绝」和「固件根本没有这条命令（只会超时）」分开。
+
+        verify=True（默认）时写完立刻用 0x05 回读，确认设备里就是刚写的值。
+        """
+        want = check_sn(sn)
+        f = self._transact(CMD_SET_SN, "snack", want.encode("ascii"),
+                           timeout=timeout)
+        status = None
+        if f is not None and f.payload:
+            status = f.payload[0]
+        if status == SN_OK:
+            pass
+        elif status == SN_ERR_FORMAT:
+            raise Y75Error("设备拒绝：序列号长度或字符不合法")
+        elif status == SN_ERR_WRITE:
+            raise Y75Error("设备保存失败（EEPROM 写入出错）")
+        elif status is not None:
+            raise Y75Error(f"设备返回未知状态 0x{status:02X}")
+        # status is None：固件只回了裸 ACK —— 不判失败，靠下面的回读兜底。
+        if not verify:
+            return want
+        got = self.query_sn()
+        if got != want:
+            raise Y75Error(f"写入后回读不一致：设备里是「{got}」")
+        return got
 
     def query_ver(self, timeout: float = 1.0) -> str:
         f = self._transact(CMD_QUERY_VER, "ver", timeout=timeout)
