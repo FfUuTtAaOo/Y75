@@ -1719,6 +1719,10 @@ class App:
         except Exception as exc:                              # noqa: BLE001
             out["status"] = None
             out["status_err"] = str(exc)
+        try:
+            out["unit"] = cli.query_unit()
+        except Exception as exc:                              # noqa: BLE001
+            out["unit"] = None
         return out
 
     def _apply_info(self, info: dict) -> None:
@@ -1731,7 +1735,6 @@ class App:
             polling = bool(self.cli and self.cli.is_polling())
             self.send_mode = 1 if polling else int(st["send_mode"])
             self.data_format = int(st["data_format"])
-            unit = FORMAT_UNIT.get(self.data_format, "")
             mode_txt = "连续采集（轮询）" if polling else st["send_mode_text"]
             self.info_labels["state"].configure(
                 text=f"{mode_txt} · {st['data_format_text']} · "
@@ -1742,11 +1745,20 @@ class App:
                 if code == self.data_format:
                     self.fmt_var.set(name)
             self.out_var.set(OUT_ASC if st["debug_mode"] == 1 else OUT_HEX)
-            self._set_units(unit)
         else:
             self.info_labels["state"].configure(
                 text=f"读取失败（{info.get('status_err', '')}）")
             self.info_labels["err"].configure(text="—")
+        # 0x0E 是单位的最直接口径（最低位 1=kg 0=N）：读到了就用它覆盖。
+        # mV 只有 0x07 能表达（0x0E 在 mV 模式也回 N），所以 0x07 说 mV 时
+        # 保留 mV，不被 0x0E 顶掉。
+        unit_q = info.get("unit")
+        if unit_q in ("kg", "N") and self.data_format != 0:
+            self.data_format = 1 if unit_q == "kg" else 2
+            for name, code in FMT_CHOICES:
+                if code == self.data_format:
+                    self.fmt_var.set(name)
+        self._set_units(FORMAT_UNIT.get(self.data_format, ""))
 
     def _set_units(self, unit: str) -> None:
         units = axis_units(unit or "N")
@@ -1862,7 +1874,11 @@ class App:
 
     # ---- 矩阵 ----
     def on_read_matrix(self) -> None:
-        self._run_async(lambda: self.cli.query_matrix(), self._apply_matrix, "读取解耦矩阵")
+        # 0x38 二进制逐行读（行号 1..6）：比 0x37 的裸 ASCII 抗总线噪声，
+        # 每行都有行号回显，错不了位。
+        def work():
+            return [self.cli.query_matrix_row(r + 1) for r in range(6)]
+        self._run_async(work, self._apply_matrix, "读取解耦矩阵")
 
     def _apply_matrix(self, mat) -> None:
         for r in range(6):
@@ -2338,8 +2354,11 @@ class App:
                           else TXT_DIM))
 
     def _update_order_hint(self) -> None:
-        self.order_hint.configure(text=f"{ByteOrder.HINT.get(self.order_var.get(), '')}"
-                                       "（Y75 固件用标准小端 = DCBA）")
+        # 这个下拉框只作用于**数据帧**（0x02/0x03 的 6×float32）。
+        # 矩阵行（0x20/0x38）在协议层固定大端，不受这里影响，写清楚免得误会。
+        self.order_hint.configure(
+            text=f"{ByteOrder.HINT.get(self.order_var.get(), '')}"
+                 "（数据帧用；矩阵行固定大端 3F 80 00 00）")
 
     def _on_toggle_raw(self) -> None:
         if self.cli is not None:

@@ -44,7 +44,7 @@ sys.path.insert(0, HERE)
 from y75_protocol import (  # noqa: E402
     ASC_FRAME_LEN, ASC_SENTINEL, ByteOrder, BusGate, CMD_QUERY_MATRIX, CMD_START,
     CMD_STOP, EOF, SOF, TcpTransport, Y75Client, Y75Error, Y75Timeout, build_cmd,
-    dump_matrix, fmt_value, parse_matrix_text,
+    dump_matrix, fmt_value, hexs, parse_matrix_text,
 )
 
 PASS = FAIL = 0
@@ -117,6 +117,16 @@ def test_connect_and_basics(cli: Y75Client) -> None:
     check("查询序列号：拿到非空 ASCII", bool(sn) and sn.isprintable(), repr(sn))
     check("查询序列号：与设备一致（HS- 开头）", sn.startswith("HS-"), sn)
 
+    # 0x0E 查单位：最低位 1=kg 0=N，与 0x07 的 data_format 应当一致
+    st2 = cli.query_status()
+    unit = cli.query_unit()
+    expect = {1: "kg", 2: "N"}.get(int(st2["data_format"]))
+    if expect is None:                        # 模拟器在 mV 模式时 0x0E 回 N
+        expect = "N"
+    check("查询单位：与状态里的单位一致", unit == expect,
+          f"0x0E={unit}, 0x07={st2['data_format_text']}")
+    check("查询序列号：与设备一致（HS- 开头）", sn.startswith("HS-"), sn)
+
 
 def test_single(cli: Y75Client) -> None:
     section("2. 单次采集")
@@ -134,12 +144,24 @@ def test_single(cli: Y75Client) -> None:
 
 
 def test_stream(cli: Y75Client) -> None:
-    section("3. 连续采集（0x03 轮询，每 50ms 一条）")
+    section("3. 连续采集（先 0x0F 点灯，再每 50ms 一条 0x03 轮询）")
     cli.stop()
     time.sleep(0.1)
     base = cli.push_count
-    cli.start()
+    logs: List[Tuple[str, str]] = []
+    prev_on_log = cli.on_log
+    cli.on_log = lambda lv, m: (logs.append((lv, m)),
+                                prev_on_log and prev_on_log(lv, m))
+    try:
+        cli.start()
+    finally:
+        cli.on_log = prev_on_log
     check("开始连续：轮询线程已启动", cli.is_polling())
+    check("开始连续：先发送了 0x0F 心跳灯",
+          any(lv == "tx" and "心跳灯" in m for lv, m in logs),
+          str([m for lv, m in logs if lv == "tx"][:3]))
+    check("模拟器识别 0x0F（没有出现无应答警告）",
+          not any("0x0F 心跳灯无应答" in m for lv, m in logs))
     check("开始连续：1 秒内就有数据帧（实际 50ms 内）", wait_push(cli, base, 1.0))
 
     n0 = cli.push_count
@@ -263,6 +285,14 @@ def test_freq_and_format(cli: Y75Client) -> None:
               str(st["data_format_text"]))
     cli.set_format(2)                 # 收尾回默认
 
+    # 0x0E 查单位跟着切：kg→01、N→00（mV 也回 N，协议只有两态）
+    cli.set_format(1)
+    u = cli.query_unit()
+    check("0x0E 在 kg 模式回 kg", u == "kg", u)
+    cli.set_format(2)
+    u = cli.query_unit()
+    check("0x0E 在 N 模式回 N", u == "N", u)
+
     # ---- ASC 裸帧模式 ----
     cli.set_asc_mode()
     check("切 ASC 后客户端标记 asc_mode", cli.asc_mode)
@@ -297,6 +327,37 @@ def test_matrix(cli: Y75Client) -> None:
           all(abs(v) < 100 for r in mat for v in r),
           f"首元素 {mat[0][0]:.6f}")
 
+    # ---- 字节序：矩阵行是大端，和数据帧（小端）不是一个口径 ----
+    # 固件按大端解 0x20 的载荷，1.0 必须是 3F 80 00 00；发成小端
+    # （00 00 80 3F）设备会读成 4.6e-41，矩阵等于被写成 0。
+    sent: List[bytes] = []
+    tx = cli.transport
+    orig_write = tx.write
+
+    def tap(data: bytes) -> None:
+        sent.append(bytes(data))
+        orig_write(data)
+
+    tx.write = tap                                    # type: ignore[method-assign]
+    try:
+        cli.set_matrix_row(0, (1.0, 0.5, -2.0, 0.0, 0.0, 0.0))
+    finally:
+        tx.write = orig_write                         # type: ignore[method-assign]
+    cli.set_matrix_row(0, mat[0])                     # 恢复原值，免得影响下面
+    fr = None
+    for b in sent:
+        if len(b) == 30 and b[:3] == b"\xAA\x55\x20":
+            fr = b                                    # 重发时取最后一帧
+    check("0x20 帧 = AA 55 20 [行号+6×f32] 0D 0A（30 字节）",
+          fr is not None and fr[28:] == b"\x0D\x0A" and fr[3] == 0,
+          hexs(fr) if fr else "没抓到 0x20 帧")
+    body = fr[4:28] if fr else b""
+    check("写矩阵 float32 是大端：1.0 → 3F 80 00 00",
+          body[:4] == b"\x3F\x80\x00\x00", hexs(body[:4]) if body else "—")
+    check("0.5 → 3F 00 00 00、-2.0 → C0 00 00 00",
+          body[4:8] == b"\x3F\x00\x00\x00" and body[8:12] == b"\xC0\x00\x00\x00",
+          hexs(body[4:12]) if body else "—")
+
     row = [0.314159, -0.271828, 0.161803, -0.057721, 0.086656, 0.007297]
     cli.set_matrix_row(4, row)
     back = cli.query_matrix()
@@ -322,6 +383,26 @@ def test_matrix(cli: Y75Client) -> None:
           all(abs(back2[r][c] - (r * 0.1 + c * 0.01)) < 1e-5
               for r in range(6) for c in range(6)),
           dump_matrix(back2).split("\n")[0])
+
+    # 0x38 二进制逐行读：行号 1..6（01=第 1 行，与 0x20 写入的 0..5 差 1）
+    row38 = cli.query_matrix_row(1)
+    check("0x38 读第 1 行与 0x37 的 matrix1 一致",
+          all(abs(a - b) < 1e-5 for a, b in zip(row38, back2[0])),
+          f"{row38[0]:.6f} vs {back2[0][0]:.6f}")
+    row38 = cli.query_matrix_row(6)
+    check("0x38 读第 6 行与 0x37 的 matrix6 一致",
+          all(abs(a - b) < 1e-5 for a, b in zip(row38, back2[5])),
+          f"{row38[0]:.6f} vs {back2[5][0]:.6f}")
+    try:
+        cli.query_matrix_row(0)
+        check("0x38 行号 0 被拒绝", False, "竟然没抛")
+    except Y75Error:
+        check("0x38 行号 0 被拒绝", True)
+    try:
+        cli.query_matrix_row(7)
+        check("0x38 行号 7 被拒绝", False, "竟然没抛")
+    except Y75Error:
+        check("0x38 行号 7 被拒绝", True)
 
     cli.set_matrix_row(0, mat[0])      # 恢复第 1 行
     bad = 0

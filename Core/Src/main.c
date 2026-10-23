@@ -68,7 +68,7 @@ volatile sensor_data_t   g_sensor;
 volatile system_state_t  g_sys;
 config_t                 g_config = {
     .sn         = "HS-01234567",
-    .fw_version = 0x00010702,
+    .fw_version = 0x00010703,
 };
 decouple_matrix_t        g_matrix;
 
@@ -357,11 +357,13 @@ int main(void)
         }
 
         /* PA12 heartbeat: toggles every 500 ms (1 Hz blink) while frames are
-           actually going out — i.e. after AA 55 02 0D 0A and while the output
-           format is one that transmits. Held low as soon as output stops. */
+           actually going out (0x02 streaming) — or while the host has explicitly
+           asked for the blink with 0x0F (poll mode has no stream to key off).
+           0x01 stops the blink again. Held low whenever output stops. */
         {
-            uint8_t streaming = (g_sys.send_mode == 1) &&
-                                (g_sys.debug_mode == 0 || g_sys.debug_mode == 1);
+            uint8_t streaming = g_sys.led_blink ||
+                                (g_sys.send_mode == 1 &&
+                                 (g_sys.debug_mode == 0 || g_sys.debug_mode == 1));
 
             if (streaming) {
                 if ((uint32_t)(g_tick_ms - g_led_toggle_ms) >= LED_BLINK_HALF_PERIOD_MS) {

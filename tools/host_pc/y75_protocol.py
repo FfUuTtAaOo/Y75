@@ -70,6 +70,8 @@ CMD_QUERY_SN = 0x05
 CMD_QUERY_VER = 0x06
 CMD_QUERY_STATUS = 0x07
 CMD_SET_FREQ = 0x08
+CMD_LED_ON = 0x0F              # 心跳灯闪烁（0x01 停止采集时同时熄灭）
+CMD_QUERY_UNIT = 0x0E          # 查询数据单位：回复最低位 1=kg 0=N
 CMD_SET_MATRIX = 0x20          # 上传解耦矩阵的某一行
 CMD_ZERO = 0x30
 CMD_HEX_SEND = 0x31            # 输出模式：HEX（标准帧，默认）
@@ -79,6 +81,7 @@ CMD_SET_MV = 0x34              # 数据单位：mV（不保存）
 CMD_SET_N = 0x35               # 数据单位：N（掉电保持）
 CMD_UNZERO = 0x36
 CMD_QUERY_MATRIX = 0x37
+CMD_QUERY_MATRIX_ROW = 0x38    # 二进制读一行矩阵：行号 1..6，回 B8+行号+6×f32
 
 #: 「开始连续」的轮询节拍：每 50 ms 发一条 0x03，设备逐条回一帧数据。
 #: （固件的 0x02 推流只保留给老版本上位机；本版 start() 不再发送 0x02。）
@@ -94,7 +97,9 @@ COMMANDS: Dict[int, Tuple[str, str]] = {
     CMD_QUERY_VER:    ("查询固件版本", "回复 3 字节：主.次.修订"),
     CMD_QUERY_STATUS: ("查询运行状态", "回复 8 字节，见 parse_status()"),
     CMD_SET_FREQ:     ("设置输出频率", "载荷 1 字节：0=500Hz 1=1000Hz"),
-    CMD_SET_MATRIX:   ("上传矩阵行", "载荷 = 行号 + 6×float32 小端，共 25 字节"),
+    CMD_LED_ON:       ("心跳灯闪烁", "设备回 ACK，PA12 以 1Hz 闪烁；0x01 熄灭"),
+    CMD_QUERY_UNIT:   ("查询单位", "回复 1 字节：最低位 1=kg 0=N"),
+    CMD_SET_MATRIX:   ("上传矩阵行", "载荷 = 行号 + 6×float32 **大端**，共 25 字节"),
     CMD_ZERO:         ("执行置零", "设备采 20 点求平均作为零点，异步完成"),
     CMD_HEX_SEND:     ("HEX 输出模式", "标准 AA55 帧（默认）"),
     CMD_ASC_SEND:     ("ASC 输出模式", "裸 28 字节帧，结尾 00 00 80 7F"),
@@ -103,6 +108,7 @@ COMMANDS: Dict[int, Tuple[str, str]] = {
     CMD_SET_N:        ("单位设为 N", "写 EEPROM，掉电保持"),
     CMD_UNZERO:       ("取消置零", "清除零点偏置"),
     CMD_QUERY_MATRIX: ("查询矩阵", "回复 6 行裸 ASCII：matrixN: a, b, c, d, e, f"),
+    CMD_QUERY_MATRIX_ROW: ("读矩阵行", "载荷 1 字节行号(1..6)，回复 B8+行号+6×float32 **大端**"),
 }
 
 #: 波特率码 ↔ 实际波特率（rs485_cmd.c::baud_from_code）
@@ -164,12 +170,19 @@ class ByteOrder:
         ABCD  标准大端          DCBA  标准小端  ← Y75 设备固件用的就是这个
         BADC  字节交换          CDAB  字交换（低字在前）
 
-    Y75 固件 rs485_cmd.c 的 float_to_le() / le_to_float() 读写两边都是标准小端，
-    自洽，所以默认 DCBA；留出下拉框只是为了兼容以后改版的设备。
+    数据帧（0x02 / 0x03 的 6×float32）走固件 rs485_cmd.c 的 float_to_le() /
+    le_to_float()，是标准小端，所以 DEFAULT = DCBA；界面上那个下拉框只影响
+    数据帧解析。
+
+    **矩阵例外**：写/读矩阵行（0x20 / 0x38）的 float32 是标准大端
+    （1.0 → 3F 80 00 00），见 MATRIX_ORDER。两者不要混。
     """
 
     NAMES = ("DCBA", "ABCD", "BADC", "CDAB")
     DEFAULT = "DCBA"
+    #: 矩阵上传/下载（0x20 / 0x38）专用：大端，1.0 → 3F 80 00 00。
+    #: 数据帧（0x02 / 0x03）仍用 DEFAULT 小端，两者不要混。
+    MATRIX_ORDER = "ABCD"
     HINT = {"DCBA": "标准小端（Y75 固件默认）", "ABCD": "标准大端",
             "BADC": "字节交换", "CDAB": "字交换"}
 
@@ -217,7 +230,9 @@ _RESP_TABLE: Dict[int, Tuple[str, Optional[int]]] = {
     CMD_SINGLE:         ("data", 24),        # 0x03 单次应答帧
     CMD_QUERY_VER:      ("ver", 3),          # 0x86
     CMD_QUERY_STATUS:   ("status", 8),       # 0x87
+    CMD_QUERY_UNIT:     ("unit", 1),         # 0x8E 最低位 1=kg 0=N
     CMD_STOP:           ("ack", 0),          # 0x81
+    CMD_LED_ON:         ("ack", 0),          # 0x8F
     CMD_SET_BAUD:       ("ack", 0),          # 0x84
     CMD_SET_FREQ:       ("ack", 0),          # 0x88
     CMD_ZERO:           ("ack", 0),          # 0xB0
@@ -227,6 +242,7 @@ _RESP_TABLE: Dict[int, Tuple[str, Optional[int]]] = {
     CMD_SET_MV:         ("ack", 0),          # 0xB4
     CMD_SET_N:          ("ack", 0),          # 0xB5
     CMD_UNZERO:         ("ack", 0),          # 0xB6
+    CMD_QUERY_MATRIX_ROW: ("matrow", 25),    # 0xB8 + 行号 + 6×float32
 }
 
 
@@ -1244,6 +1260,15 @@ class Y75Client:
         with self._poll_lock:
             if self._poll_thread is not None and self._poll_thread.is_alive():
                 return                          # 已在轮询：重复点击是 no-op
+            # 轮询模式没有推流帧可挂心跳灯，先让设备把 PA12 闪起来。
+            # 灯是提示作用：老固件不认识 0x0F（不回 ACK），超时只警告，
+            # 不阻断采集；这帧在任何轮询启动前完成，迟到的 ACK 不会
+            # 被 single() 的 waiter 错认。
+            try:
+                self._transact(CMD_LED_ON, "ack", timeout=0.3)
+            except Y75Timeout:
+                self._log("warn", "0x0F 心跳灯无应答（固件可能未更新），"
+                                  "继续采集")
             self._break_stream_clock()
             self._poll_stop.clear()
             self._poll_thread = threading.Thread(
@@ -1358,6 +1383,32 @@ class Y75Client:
             raise Y75Error("运行状态回复长度不足")
         return parse_status(f.payload)
 
+    def query_unit(self, timeout: float = 1.0) -> str:
+        """查当前数据单位（0x0E）：回复字节最低位 1=kg、0=N。
+
+        协议上只有 kg/N 两态，mV 模式也回 0（N）——要区分 mV 得看 0x07。
+        """
+        f = self._transact(CMD_QUERY_UNIT, "unit", timeout=timeout)
+        if f is None or len(f.payload) < 1:
+            raise Y75Error("单位回复长度不足")
+        return "kg" if f.payload[0] & 0x01 else "N"
+
+    def query_matrix_row(self, row: int, timeout: float = 1.0) -> List[float]:
+        """读一行矩阵（0x38）：行号 **1..6**（01=第一行，与 0x37 的
+        matrix1..6 对齐；注意 0x20 写入的行号是 0..5，两者差 1）。
+
+        回复 AA 55 B8 [行号] [6×float32 大端] 0D 0A，行号原样带回，
+        靠 _cmd_lock 串行保证不会张冠李戴。
+        """
+        row = int(row)
+        if not 1 <= row <= 6:
+            raise Y75Error(f"矩阵行号超出 1..6：{row}")
+        f = self._transact(CMD_QUERY_MATRIX_ROW, "matrow", bytes((row,)),
+                           timeout=timeout, resp_cmd=0xB8)
+        if f is None or len(f.payload) != 25 or f.payload[0] != row:
+            raise Y75Error("矩阵行回复长度或行号不符")
+        return list(ByteOrder.decode6(f.payload[1:25], ByteOrder.MATRIX_ORDER))
+
     def set_freq(self, hz: int) -> None:
         self._transact(CMD_SET_FREQ, "ack", bytes((0 if int(hz) == 500 else 1,)))
         self.note_freq_hz(hz)
@@ -1435,12 +1486,12 @@ class Y75Client:
         self._transact(cmd, "ack")
 
     def set_matrix_row(self, row: int, values: Sequence[float]) -> None:
-        """上传解耦矩阵的一行（0 起）。载荷 = 行号 + 6×float32 = 25 字节。"""
+        """上传解耦矩阵的一行（0 起）。载荷 = 行号 + 6×float32（大端）= 25 字节。"""
         if not 0 <= int(row) <= 5:
             raise Y75Error("矩阵行号必须是 0..5")
         if len(values) != 6:
             raise Y75Error("上传矩阵行必须正好 6 个数")
-        payload = bytes((int(row),)) + ByteOrder.encode6(values, self.byte_order)
+        payload = bytes((int(row),)) + ByteOrder.encode6(values, ByteOrder.MATRIX_ORDER)
         self._transact(CMD_SET_MATRIX, "matrixack", payload, timeout=2.0,
                        resp_cmd=(0xA0 | int(row)))
 

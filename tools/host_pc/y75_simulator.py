@@ -32,7 +32,10 @@ from typing import Dict, List, Optional, Tuple
 
 from y75_protocol import (
     ASC_SENTINEL, BAUD_CODES, ByteOrder, CMD_ASC_SEND, CMD_HEX_SEND,
-    CMD_QUERY_MATRIX, CMD_QUERY_SN, CMD_QUERY_STATUS, CMD_QUERY_VER, CMD_SET_BAUD,
+    CMD_LED_ON, CMD_QUERY_MATRIX, CMD_QUERY_MATRIX_ROW, CMD_QUERY_SN,
+    CMD_QUERY_STATUS, CMD_QUERY_UNIT,
+    CMD_QUERY_VER,
+    CMD_SET_BAUD,
     CMD_SET_FREQ, CMD_SET_KG, CMD_SET_MATRIX, CMD_SET_MV, CMD_SET_N, CMD_SINGLE,
     CMD_START, CMD_STOP, CMD_UNZERO, CMD_ZERO, EOF, RESP_FLAG, SOF, dump_matrix,
     frame_text, hexs,
@@ -113,6 +116,7 @@ class Device:
         self.zero_busy = 0
         self.comm_error = 0
         self.status_flags = 0              # BIT0 自动启动, BIT1 运行中
+        self.led_blink = 0                 # 0x0F 置位、0x01 清零（PA12 心跳灯）
         self.zero_offset = [0.0] * 6
 
         self.sn = DEFAULT_SN
@@ -191,7 +195,15 @@ class Device:
             with self.lock:
                 self.send_mode = 0
                 self.status_flags &= ~0x0002
-            self.log("收到 0x01 停止连续发送 → 回 ACK")
+                self.led_blink = 0
+            self.log("收到 0x01 停止连续发送 → 回 ACK（心跳灯灭）")
+            return with_ack([])
+
+        # ---- 0x0F 心跳灯闪烁（轮询模式没有推流帧可挂灯，单独开） ----
+        if cmd == CMD_LED_ON:
+            with self.lock:
+                self.led_blink = 1
+            self.log("收到 0x0F 心跳灯 → 回 ACK，PA12 开始 1Hz 闪烁")
             return with_ack([])
 
         # ---- 0x02 开始连续发送 ----
@@ -242,6 +254,14 @@ class Device:
                               self.status_flags & 0xFF, (self.status_flags >> 8) & 0xFF,
                               self.comm_error & 0xFF, (self.comm_error >> 8) & 0xFF))
             self.log("收到 0x07 查状态 → " + hexs(data))
+            return [self.ack(cmd, data)]
+
+        # ---- 0x0E 查单位：1 字节，最低位 1=kg 0=N ----
+        if cmd == CMD_QUERY_UNIT:
+            with self.lock:
+                data = bytes((1 if self.data_format == 1 else 0,))
+            self.log("收到 0x0E 查单位 → 回 " + hexs(self.ack(cmd, data))
+                     + f"（{'kg' if data[0] else 'N'}）")
             return [self.ack(cmd, data)]
 
         # ---- 0x08 设置频率（空载荷 → 当成非法） ----
@@ -342,7 +362,9 @@ class Device:
                 self.comm_error = (self.comm_error + 1) & 0xFFFF
                 self.log(f"0x20 行号 {row} 越界 → 不处理")
                 return None
-            vals = ByteOrder.decode6(payload[1:25], self.order)
+            # 矩阵行固定大端（1.0 → 3F 80 00 00），与数据帧的 self.order 无关：
+            # 固件 rs485_cmd.c 的矩阵解析走的是大端，别跟推流帧混。
+            vals = ByteOrder.decode6(payload[1:25], ByteOrder.MATRIX_ORDER)
             with self.lock:
                 self.matrix[row] = list(vals)
             self.log(f"0x20 上传矩阵第 {row + 1} 行 → " +
@@ -351,6 +373,23 @@ class Device:
             if cmd in self.no_ack:
                 return None
             return [self.ack(cmd | row)]
+
+        if cmd == CMD_QUERY_MATRIX_ROW:
+            # 行号 1..6（01=第一行，与 0x37 的 matrix1..6 对齐）；
+            # 0x20 写入的行号是 0..5，这里换算时差 1。
+            row = payload[0] if payload else 0
+            if not 1 <= row <= 6:
+                self.comm_error = (self.comm_error + 1) & 0xFFFF
+                self.log(f"0x38 行号 {row} 越界 → 不处理")
+                return None
+            with self.lock:
+                vals = list(self.matrix[row - 1])
+            data = bytes((row,)) + ByteOrder.encode6(vals, ByteOrder.MATRIX_ORDER)
+            self.log(f"0x38 读矩阵第 {row} 行 → " +
+                     ", ".join(f"{v:.6f}" for v in vals))
+            if cmd in self.no_ack:
+                return None
+            return [self.ack(cmd, data)]
 
         return self.handle(cmd)
 
@@ -726,12 +765,28 @@ def _selftest() -> int:                                  # pragma: no cover
                                      for i, c in enumerate(chunks)),
           chunks[0][:16].decode())
     row5 = [5.0, 5.1, 5.2, 5.3, 5.4, 5.5]
-    ack = dev.handle_payload(0x20, bytes((5,)) + ByteOrder.encode6(row5))
+    ack = dev.handle_payload(0x20, bytes((5,))
+                           + ByteOrder.encode6(row5, ByteOrder.MATRIX_ORDER))
     check("0x20 行 ACK 带行号", ack == [b"\xAA\x55\xA5\x0D\x0A"], hexs(ack[0]))
     check("0x20 矩阵已更新（float32 精度内）",
           all(abs(a - b) < 1e-6 for a, b in zip(dev.matrix[5], row5)),
           str(dev.matrix[5]))
     check("0x20 载荷不足时拒绝", dev.handle_payload(0x20, b"\x00\x01") is None)
+
+    # 0x38 二进制读一行：行号 1..6，回 B8 + 行号 + 6×float32
+    row = [0.298418, -0.211604, 0.0, 0.0, 0.0, 0.0]
+    dev.handle_payload(0x20, bytes((0,))
+                       + ByteOrder.encode6(row, ByteOrder.MATRIX_ORDER))
+    got = dev.handle_payload(0x38, b"\x01")
+    check("0x38 读第 1 行回 B8 01 + 6×float32",
+          got is not None and got[0][:3] == b"\xAA\x55\xB8" and got[0][3] == 1
+          and len(got[0]) == 30
+          and all(abs(a - b) < 1e-6 for a, b in
+                  zip(ByteOrder.decode6(got[0][4:28], ByteOrder.MATRIX_ORDER), row)),
+          hexs(got[0]) if got else "无回复")
+    check("0x38 行号 0/7 越界不回",
+          dev.handle_payload(0x38, b"\x00") is None
+          and dev.handle_payload(0x38, b"\x07") is None)
 
     # ASC 模式
     dev.handle(0x32)
@@ -748,6 +803,26 @@ def _selftest() -> int:                                  # pragma: no cover
     check("0x30 置零后 busy=1", dev.zero_busy == 1)
     time.sleep(0.55)
     check("0x30 置零 0.4s 后自动完成", dev.zero_busy == 0)
+
+    # 心跳灯：0x0F 置位 + ACK，0x01 清零
+    ack = dev.handle(0x0F)
+    check("0x0F 回 ACK 0x8F 且置闪烁",
+          ack == [b"\xAA\x55\x8F\x0D\x0A"] and dev.led_blink == 1,
+          hexs(ack[0]) if ack else "无回复")
+    dev.handle(0x01)
+    check("0x01 熄灭心跳灯", dev.led_blink == 0)
+
+    # 查单位：最低位 1=kg 0=N
+    dev.data_format = 1
+    ack = dev.handle(0x0E)
+    check("0x0E 在 kg 模式回 8E 01",
+          ack == [b"\xAA\x55\x8E\x01\x0D\x0A"],
+          hexs(ack[0]) if ack else "无回复")
+    dev.data_format = 2
+    ack = dev.handle(0x0E)
+    check("0x0E 在 N 模式回 8E 00",
+          ack == [b"\xAA\x55\x8E\x00\x0D\x0A"],
+          hexs(ack[0]) if ack else "无回复")
 
     # 未知命令只计错
     before = dev.comm_error

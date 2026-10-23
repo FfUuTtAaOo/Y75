@@ -29,7 +29,8 @@ typedef struct {
     uint8_t  zero_calib_busy;/* 1 = collecting 20 force samples for zero */
     uint8_t  zero_calib_count;
     uint8_t  adc_ready;      /* set by ADC ISR, cleared after reading    */
-    uint8_t  _pad[2];
+    uint8_t  led_blink;      /* 1 = PA12 heartbeat blink (0x0F on, 0x01 off) */
+    uint8_t  _pad[1];
     uint16_t status_flags;   /* BIT0 = auto-start, BIT1 = active       */
     uint16_t comm_error_cnt; /* RS485 communication error counter      */
     uint32_t frame_seq;      /* continuous-send frame sequence number  */

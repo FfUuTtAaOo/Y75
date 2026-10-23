@@ -25,6 +25,7 @@ extern "C" {
 #define RS485_CMD_ZERO          0x30  /* Zero calibration (set offsets)      */
 #define RS485_CMD_UNZERO        0x36  /* Cancel zero (clear offsets)         */
 #define RS485_CMD_QUERY_MATRIX  0x37  /* Query the 6×6 matrix (144 bytes)    */
+#define RS485_CMD_QUERY_MATRIX_ROW 0x38 /* Read one matrix row as binary     */
 #define RS485_CMD_HEX_SEND      0x31
 #define RS485_CMD_ASC_SEND      0x32
 #define RS485_CMD_SET_FORMAT_KG 0x33  /* Set data format: 0=mV,1=kg,2=N      */
@@ -36,8 +37,8 @@ extern "C" {
 #define RS485_CMD_SET_IP        0x0B  /* Set IP address   (4 bytes)          */
 #define RS485_CMD_SET_MAC       0x0C  /* Set MAC address  (6 bytes)          */
 #define RS485_CMD_SET_SUBNET    0x0D  /* Set subnet mask  (4 bytes)          */
-#define RS485_CMD_SET_GW        0x0E  /* Set gateway      (4 bytes)          */
-#define RS485_CMD_QUERY_NET     0x0F  /* Query network config                */
+#define RS485_CMD_QUERY_UNIT    0x0E  /* Query data unit: 8E [01=kg 00=N]    */
+#define RS485_CMD_LED_ON        0x0F  /* LED 1Hz blink on; 0x01 turns it off */
 #define RS485_CMD_SET_MATRIX    0x20  /* Upload decoupling matrix (144 bytes) */
 #define RS485_CMD_DEBUG_MODE    0x35  /* Toggle debug mode                   */
 

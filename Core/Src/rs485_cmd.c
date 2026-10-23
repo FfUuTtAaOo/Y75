@@ -33,6 +33,27 @@ static float le_to_float(const uint8_t *src)
     float f; memcpy(&f, &u, 4); return f;
 }
 
+/* Big-endian variants — used ONLY by the matrix upload/download commands
+   (0x20 / 0x38).  1.0f goes on the wire as 3F 80 00 00.  The data frames
+   (0x02 / 0x03) keep little-endian, do not mix them up. */
+static void float_to_be(uint8_t *dst, float f)
+{
+    uint32_t u; memcpy(&u, &f, 4);
+    dst[0] = (uint8_t)(u >> 24);
+    dst[1] = (uint8_t)(u >> 16);
+    dst[2] = (uint8_t)(u >> 8);
+    dst[3] = (uint8_t)(u);
+}
+
+static float be_to_float(const uint8_t *src)
+{
+    uint32_t u = ((uint32_t)src[0] << 24)
+               | ((uint32_t)src[1] << 16)
+               | ((uint32_t)src[2] << 8)
+               | ((uint32_t)src[3]);
+    float f; memcpy(&f, &u, 4); return f;
+}
+
 /* Send a response frame: AA 55 [cmd|0x80] [data...] 0D 0A */
 static void respond(uint8_t cmd, const uint8_t *data, uint16_t len)
 {
@@ -206,9 +227,25 @@ void rs485_cmd_dispatch(uint8_t cmd, const uint8_t *payload, uint16_t len)
 
     switch (cmd) {
 
-    /* ---- 0x01  Stop continuous send ---- */
+    /* ---- 0x01  Stop continuous send (also turns the heartbeat LED off) ---- */
     case RS485_CMD_STOP:
         g_sys.send_mode = 0;
+        g_sys.led_blink = 0;
+        ack(cmd);
+        break;
+
+    /* ---- 0x0E  Query data unit: AA 55 8E [01=kg 00=N] 0D 0A ----
+       Only kg/N are representable here (LSB of the payload byte);
+       mV mode also answers 0x00 — the 0x07 status query is the one
+       that can tell mV apart. */
+    case RS485_CMD_QUERY_UNIT:
+        buf[0] = (g_sys.data_format == 1) ? 0x01U : 0x00U;
+        respond(cmd, buf, 1);
+        break;
+
+    /* ---- 0x0F  Heartbeat LED on: 1 Hz blink until 0x01 is received ---- */
+    case RS485_CMD_LED_ON:
+        g_sys.led_blink = 1;
         ack(cmd);
         break;
 
@@ -331,6 +368,26 @@ void rs485_cmd_dispatch(uint8_t cmd, const uint8_t *payload, uint16_t len)
                so the output is readable as-is in a terminal. */
             original_send((const uint8_t *)line, (uint16_t)n);
         }
+        break;
+    }
+
+    /* ---- 0x38  Read one matrix row as binary ----
+       Request:  AA 55 38 [row 1..6] 0D 0A
+       Reply:    AA 55 B8 [row] [6×float32 LE] 0D 0A   (25-byte payload)
+       Row numbers are 1-based (01 = matrix1), matching the 0x37 text
+       output; the 0x20 upload keeps its original 0-based row byte. */
+    case RS485_CMD_QUERY_MATRIX_ROW: {
+        uint8_t r;
+        if (len < 1 || payload[0] == 0U || payload[0] > 6U) {
+            g_sys.comm_error_cnt++;
+            break;
+        }
+        r = (uint8_t)(payload[0] - 1U);
+        buf[0] = payload[0];
+        for (int i = 0; i < 6; i++) {
+            float_to_be(buf + 1 + i * 4, g_matrix.m[r][i]);
+        }
+        respond(cmd, buf, 25);
         break;
     }
 
