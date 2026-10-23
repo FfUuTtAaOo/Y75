@@ -5,7 +5,7 @@ a = Analysis(
     ['y75_app.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('zkmd.ico', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -36,5 +36,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     version='version_info.py',
-    icon=['y75_host.ico'],
+    icon=['zkmd.ico'],
 )

@@ -15,7 +15,7 @@ make_icon.py —— 生成程序图标(.ico) 与界面截图(.png)，纯标准�
     不受动画重绘影响）→ GetDIBits 取 32bpp BGRA → 压成 PNG。
 
 用法：
-    python make_icon.py --ico y75_host.ico
+    python make_icon.py --ico zkmd.ico
     python make_icon.py --shot ui.png --title "Y75"
     python make_icon.py --selftest
 """

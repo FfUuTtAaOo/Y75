@@ -878,7 +878,7 @@ class App:
     #  界面搭建
     # ==================================================================
     def _build_ui(self) -> None:
-        self.root.title("Y75 六维力传感器上位机  ·  RS485  AA 55 … 0D 0A")
+        self.root.title("中科米点 六维力传感器上位机")
         self.root.configure(bg=BG)
         self._apply_theme()
 
@@ -905,9 +905,9 @@ class App:
         # ---------- 顶栏 ----------
         top = tk.Frame(root, bg=CARD, highlightthickness=1, highlightbackground=EDGE)
         top.grid(row=0, column=0, columnspan=2, sticky="ew")
-        tk.Label(top, text="Y75 六维力传感器上位机", bg=CARD, fg=TXT,
+        tk.Label(top, text="中科米点 Y75", bg=CARD, fg=TXT,
                  font=(self.font, 13, "bold")).pack(side="left", padx=14, pady=9)
-        tk.Label(top, text="协议：AA 55 [CMD] [PAYLOAD] 0D 0A   ·   默认 460800 8N1",
+        tk.Label(top, text="协议: AA 55 [CMD] [PAYLOAD] 0D 0A   ·   默认 460800 8N1",
                  bg=CARD, fg=TXT_DIM, font=(self.font, 9)).pack(side="left")
         self.conn_label = tk.Label(top, text="未连接", bg=CARD, fg=TXT_DIM,
                                    font=(self.font, 10, "bold"))
@@ -2463,6 +2463,55 @@ def raise_timer_resolution() -> None:
         pass
 
 
+# =====================================================================
+#  窗口 / exe 图标
+# =====================================================================
+#: 图标文件名。和 y75_app.py 放同一目录；打包时 build_exe.bat 用
+#: --icon 把它塞进 exe 资源（资源管理器/任务栏），再用 --add-data 把
+#: 同一份文件解到 _MEIPASS（Tk 设窗口角标要读文件，不能从 exe 资源读）。
+ICON_NAME = "zkmd.ico"
+
+
+def app_dir() -> str:
+    """脚本所在目录；PyInstaller onefile 运行时是临时解包目录 _MEIPASS。"""
+    return getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+
+
+def icon_path() -> Optional[str]:
+    p = os.path.join(app_dir(), ICON_NAME)
+    return p if os.path.exists(p) else None
+
+
+def apply_window_icon(root: tk.Tk) -> bool:
+    """
+    把 zkmd.ico 设为窗口左上角角标（同时影响任务栏和 messagebox）。
+
+    Tk 的 default=... 设的是「本进程所有顶层窗口的默认图标」，弹窗也跟着换；
+    个别 Tk 版本只认单参数形式，所以两条都试。最后再兜一层「直接从 exe 里
+    取图标资源」——万一打包时漏了 --add-data，界面也不会退回 Tk 的羽毛。
+    """
+    p = icon_path()
+    if p:
+        try:
+            root.iconbitmap(default=p)
+            return True
+        except tk.TclError:
+            pass
+        try:
+            root.iconbitmap(p)
+            return True
+        except tk.TclError:
+            pass
+    exe = sys.executable
+    if exe.lower().endswith(".exe") and os.path.exists(exe):
+        try:
+            root.iconbitmap(default=exe)      # WM_SETICON 从 exe 的 RT_GROUP_ICON 取
+            return True
+        except tk.TclError:
+            pass
+    return False
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description="Y75 六维力传感器上位机（RS485，协议 AA 55 [CMD] [PAYLOAD] 0D 0A）")
@@ -2489,6 +2538,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 3
 
     app = App(root, args)
+    icon_ok = apply_window_icon(root)      # 左上角角标 / 任务栏 / 弹窗都用 zkmd.ico
     root.protocol("WM_DELETE_WINDOW", app.on_close)
 
     if args.selftest:
@@ -2496,6 +2546,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         root.update()
         print("[ OK ] 界面已建立：控件数 =", len(root.winfo_children()))
         print("[ OK ] tkinter 可用，字体 =", app.font)
+        print("[ OK ] 窗口图标 =", "zkmd.ico" if icon_ok else "未设置（找不到图标文件）")
         root.destroy()
         return 0
 

@@ -31,6 +31,32 @@ def _pid_name(pid: int) -> str:
         ctypes.windll.kernel32.CloseHandle(h)
 
 
+def _find_windows(title: str) -> list:
+    """按标题枚举**所有**可见顶层窗口（同名窗口可能不止一个）。"""
+    user32 = ctypes.windll.user32
+    out = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    def cb(hwnd, _lparam):
+        if user32.IsWindowVisible(hwnd):
+            n = user32.GetWindowTextLengthW(hwnd)
+            if n:
+                buf = ctypes.create_unicode_buffer(n + 1)
+                user32.GetWindowTextW(hwnd, buf, n + 1)
+                if title.lower() in buf.value.lower():
+                    out.append(hwnd)
+        return True
+
+    user32.EnumWindows(cb, None)
+    return out
+
+
+def _owner_of(hwnd: int) -> tuple:
+    pid = ctypes.c_ulong(0)
+    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return _pid_name(pid.value), pid.value
+
+
 def main() -> int:
     os.chdir(HERE)
     sys.path.insert(0, HERE)
@@ -53,26 +79,34 @@ def main() -> int:
     print("exe pid =", app.pid)
 
     hwnd = None
-    for _ in range(60):
+    want = os.path.basename(EXE)
+
+    def _pick() -> int | None:
+        for h in _find_windows("六维力传感器上位机"):
+            if _owner_of(h)[0] == want:      # 同名标题可能属于别的实例（如用户手上的改名版）
+                return h
+        return None
+
+    for i in range(60):
         time.sleep(0.5)
-        hwnd = make_icon.find_window_by_title("Y75 六维力传感器上位机")
+        hwnd = _pick()
         if hwnd:
             break
+        if i % 6 == 0:                    # 每 3 秒报一次，卡住时好定位
+            print(f"  …等窗口 {i * 0.5:.1f}s  poll={app.poll()}  "
+                  f"wins={[(h, _owner_of(h)[0]) for h in _find_windows('六维力')]}")
     if not hwnd:
         print("[FAIL] 没找到 exe 的窗口")
         app.kill(); sim.kill()
         return 1
     # 确认窗口确实属于我们的 exe（onefile 的窗口在 bootloader 子进程里，
     # 所以只校验进程名，不比 PID —— PID 会是 bootloader 的子进程）
-    pid_buf = ctypes.c_ulong(0)
-    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_buf))
-    owner = _pid_name(pid_buf.value)
-    if owner != os.path.basename(EXE):
-        print(f"[FAIL] 找到的窗口属于 {owner}({pid_buf.value})，"
-              f"而不是 {os.path.basename(EXE)}（可能有旧实例残留）")
+    owner, owner_pid = _owner_of(hwnd)
+    if owner != want:
+        print(f"[FAIL] 找到的窗口属于 {owner}({owner_pid})，而不是 {want}")
         app.kill(); sim.kill()
         return 1
-    print("hwnd =", hwnd, "窗口进程 =", owner, f"(pid {pid_buf.value}, "
+    print("hwnd =", hwnd, "窗口进程 =", owner, f"(pid {owner_pid}, "
           f"bootloader pid {app.pid})")
 
     # 让连接 + 推流跑一会儿，波形里才有数据

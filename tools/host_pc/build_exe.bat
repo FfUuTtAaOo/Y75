@@ -37,7 +37,10 @@ REM ---- a FRESH workpath every run: avoids touching old temp dirs --
 set "WORK=build_y75_%RANDOM%%RANDOM%"
 
 echo [INFO] building with %PY% ...
-"%PY%" -m PyInstaller --onefile --windowed --name Y75_Host --icon y75_host.ico ^
+REM  --icon zkmd.ico      → 写进 exe 的图标资源（资源管理器 / 任务栏）
+REM  --add-data zkmd.ico  → 解到 _MEIPASS，运行时给 Tk 设窗口左上角角标用
+"%PY%" -m PyInstaller --onefile --windowed --name Y75_Host --icon zkmd.ico ^
+  --add-data "zkmd.ico;." ^
   --version-file version_info.py --clean --noconfirm ^
   --workpath "%WORK%" --distpath dist y75_app.py
 if errorlevel 1 (
