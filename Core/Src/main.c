@@ -68,7 +68,7 @@ volatile sensor_data_t   g_sensor;
 volatile system_state_t  g_sys;
 config_t                 g_config = {
     .sn         = "HS-01234567",
-    .fw_version = 0x00010704,     /* V1.7.4：新增 0x0A 写序列号（存 EEPROM 0xB0） */
+    .fw_version = 0x00010705,     /* V1.7.4：新增 0x0A 写序列号（存 EEPROM 0xB0） */
 };
 decouple_matrix_t        g_matrix;
 
