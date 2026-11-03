@@ -350,6 +350,7 @@ int main(void)
                 adc_data_usr_count = adc_data_int_count;
                 for (uint8_t i = 0; i < ADC_CHANNEL_NUM; i++) {
                     adc_tmp[i] = adc_data_calculate(i);
+                    adc_tmp[i] *= 5 / 3.3;
 
                     if (g_sys.zero_calib_busy == 0) {
                         adc_tmp[i] -= g_sensor.force_zero[i];
