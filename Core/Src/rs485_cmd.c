@@ -24,6 +24,9 @@ static void float_to_le(uint8_t *dst, float f)
     dst[3] = (uint8_t)(u >> 24);
 }
 
+/* 小端解码。矩阵命令（0x20/0x38）现在走大端 be_to_float，这里暂时没有
+   调用点，保留着方便真机若仍是小端时回滚；attribute 只是消警告。 */
+__attribute__((unused))
 static float le_to_float(const uint8_t *src)
 {
     uint32_t u = ((uint32_t)src[3] << 24)
@@ -413,7 +416,7 @@ void rs485_cmd_dispatch(uint8_t cmd, const uint8_t *payload, uint16_t len)
 
     /* ---- 0x38  Read one matrix row as binary ----
        Request:  AA 55 38 [row 1..6] 0D 0A
-       Reply:    AA 55 B8 [row] [6×float32 LE] 0D 0A   (25-byte payload)
+       Reply:    AA 55 B8 [row] [6×float32 BE] 0D 0A   (25-byte payload)
        Row numbers are 1-based (01 = matrix1), matching the 0x37 text
        output; the 0x20 upload keeps its original 0-based row byte. */
     case RS485_CMD_QUERY_MATRIX_ROW: {
