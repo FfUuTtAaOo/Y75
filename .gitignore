@@ -1,3 +1,5 @@
 build
 mx.scratch
 !.settings
+.workbuddy/memory
+tools/host_pc/dist/old
