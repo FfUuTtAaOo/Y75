@@ -316,10 +316,6 @@ int main(void)
         g_sys.data_format = (fmt == 1 || fmt == 2) ? fmt : 2;
     }
 
-    /* Restore the serial number written by 0x0A.  A blank EEPROM reads
-       back as 0xFF; anything with a non-printable byte is treated as
-       corrupt.  Both fall back to the compile-time default in g_config,
-       so a bad page can never leave the device without an SN. */
     {
         uint8_t sn_buf[SN_MAX_LEN + 1];
         uint8_t n = 0, ok = 1;
@@ -377,10 +373,6 @@ int main(void)
             g_last_rs485_send_ms = g_tick_ms;   /* reset timer on stop */
         }
 
-        /* PA12 heartbeat: toggles every 500 ms (1 Hz blink) while frames are
-           actually going out (0x02 streaming) — or while the host has explicitly
-           asked for the blink with 0x0F (poll mode has no stream to key off).
-           0x01 stops the blink again. Held low whenever output stops. */
         {
             uint8_t streaming = g_sys.led_blink ||
                                 (g_sys.send_mode == 1 &&

@@ -33,13 +33,9 @@ extern "C" {
 #define RS485_CMD_SET_FORMAT    0x34  /* Set data format: 0=mV,1=kg,2=N      */
 #define RS485_CMD_SET_FORMAT_N  0x35  /* Set data format: 0=mV,1=kg,2=N      */
 
-#define RS485_CMD_SET_IP        0x0B  /* Set IP address   (4 bytes)          */
-#define RS485_CMD_SET_MAC       0x0C  /* Set MAC address  (6 bytes)          */
-#define RS485_CMD_SET_SUBNET    0x0D  /* Set subnet mask  (4 bytes)          */
 #define RS485_CMD_QUERY_UNIT    0x0E  /* Query data unit: 8E [01=kg 00=N]    */
 #define RS485_CMD_LED_ON        0x0F  /* LED 1Hz blink on; 0x01 turns it off */
 #define RS485_CMD_SET_MATRIX    0x20  /* Upload decoupling matrix (144 bytes) */
-#define RS485_CMD_DEBUG_MODE    0x35  /* Toggle debug mode                   */
 
 /** @name Baud-rate codes — payload byte of RS485_CMD_SET_BAUD (AA 55 04 [code] 0D 0A) */
 /*@{*/
@@ -48,10 +44,6 @@ extern "C" {
 #define RS485_BAUD_115200       0x03  /* 115200 bps                          */
 #define RS485_BAUD_19200        0x04  /* 19200  bps                          */
 #define RS485_BAUD_9600         0x05  /* 9600   bps                          */
-/*@}*/
-
-/** @name Continuous data frame CMD byte */
-#define RS485_CMD_CONT_DATA     0x02  /* Continuous/single data frame        */
 /*@}*/
 
 /** @name Response flag (OR-ed with command code in response frame) */
