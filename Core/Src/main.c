@@ -270,6 +270,8 @@ int main(void)
   MX_I2C2_Init();
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+
     /* Restore the persisted baud rate (written by RS485_CMD_SET_BAUD).
        Fall back to 460800 when the EEPROM is blank or holds an unsupported
        value, so a corrupt entry can never brick the communication link. */
