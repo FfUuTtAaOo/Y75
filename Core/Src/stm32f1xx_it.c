@@ -89,15 +89,16 @@ void NMI_Handler(void)
 /**
   * @brief This function handles Hard fault interrupt.
   */
-__attribute__((naked)) void HardFault_Handler(void)
+void HardFault_Handler(void)
 {
-//   __asm volatile(
-//       "tst   lr, #4            \n"   /* EXC_RETURN bit2: 0=MSP 1=PSP */
-//       "ite   eq                \n"
-//       "mrseq r0, msp           \n"
-//       "mrsne r0, psp           \n"
-//       "mov   r1, lr            \n"
-//       "b     HardFault_Report  \n");
+  /* USER CODE BEGIN HardFault_IRQn 0 */
+
+  /* USER CODE END HardFault_IRQn 0 */
+  while (1)
+  {
+    /* USER CODE BEGIN W1_HardFault_IRQn 0 */
+    /* USER CODE END W1_HardFault_IRQn 0 */
+  }
 }
 
 /**

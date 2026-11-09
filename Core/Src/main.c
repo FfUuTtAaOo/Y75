@@ -68,7 +68,7 @@ volatile sensor_data_t   g_sensor;
 volatile system_state_t  g_sys;
 config_t                 g_config = {
     .sn         = "HS-01234567",
-    .fw_version = 0x00010705,     /* V1.7.4：新增 0x0A 写序列号（存 EEPROM 0xB0） */
+    .fw_version = 0x00010706,
 };
 decouple_matrix_t        g_matrix;
 
@@ -291,6 +291,7 @@ int main(void)
         }
     }
     CUSTOM_USART1_Init();
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, GPIO_PIN_SET);
 
     calib_init();
     uart_debug("Data Transformation Layer Init OK\r\n");
