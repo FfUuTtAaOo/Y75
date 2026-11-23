@@ -1914,7 +1914,7 @@ class App:
     def on_start(self) -> None:
         def done(_res):
             self.send_mode = 1
-            self._log_ui("info", "已开始连续采集（每 50 ms 发一条 0x03 轮询，"
+            self._log_ui("info", "已开始连续采集（每 100 ms 发一条 0x03 轮询，"
                                  "点「停止」即停发）")
         self._run_async(lambda: self.cli.start(), done, "开始连续采集")
 
@@ -2352,7 +2352,13 @@ class App:
 
         # ---- 结论 ----
         bad = []
-        if 0.0 < self.frame_rate < 150.0:
+        # 轮询模式的帧率就是 1/POLL_INTERVAL（100ms → 约 10Hz），
+        # 不能拿推流模式的 150Hz 口径误判成「数据端慢」。
+        if cli.is_polling():
+            if 0.0 < self.frame_rate < 8.0:
+                bad.append(f"轮询帧率只有 {self.frame_rate:.0f}Hz（应约 10Hz）："
+                           f"查串口是否丢帧/超时（累计错误 {cli.cmd_errors}）")
+        elif 0.0 < self.frame_rate < 150.0:
             bad.append(f"帧率仅 {self.frame_rate:.0f}Hz，数据端本身就慢："
                        f"查波特率（{baud if baud else '—'}）是否够、"
                        f"以及固件 rs485_send_continuous 的主循环节拍")

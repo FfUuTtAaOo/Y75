@@ -84,9 +84,9 @@ CMD_UNZERO = 0x36
 CMD_QUERY_MATRIX = 0x37
 CMD_QUERY_MATRIX_ROW = 0x38    # 二进制读一行矩阵：行号 1..6，回 B8+行号+6×f32
 
-#: 「开始连续」的轮询节拍：每 50 ms 发一条 0x03，设备逐条回一帧数据。
+#: 「开始连续」的轮询节拍：每 100 ms 发一条 0x03，设备逐条回一帧数据。
 #: （固件的 0x02 推流只保留给老版本上位机；本版 start() 不再发送 0x02。）
-POLL_INTERVAL = 0.05
+POLL_INTERVAL = 0.10
 
 #: 命令码 → (中文名, 一句话说明)
 COMMANDS: Dict[int, Tuple[str, str]] = {
@@ -1186,7 +1186,7 @@ class Y75Client:
             self.push_count += 1
             if frame.cmd == CMD_START:
                 # 只有 0x02 推流帧能校节拍（节拍是设备定的）；0x03 轮询应答的
-                # 节奏是主机自己定的 50ms，拿去校会把 sample_dt 带偏。
+                # 节奏是主机自己定的 100ms，拿去校会把 sample_dt 带偏。
                 self._tune_rate(now)               # 实测节拍，修正 sample_dt
             self.wave.append((ts, vals))
             # 攒够一批再裁，别每帧都搬一次列表
@@ -1291,7 +1291,7 @@ class Y75Client:
 
     def start(self, interval: float = POLL_INTERVAL) -> None:
         """
-        开始连续采集（轮询模式）：每 interval 秒（默认 50ms）发一条 0x03，
+        开始连续采集（轮询模式）：每 interval 秒（默认 100ms）发一条 0x03，
         设备逐条回一帧数据；点「停止」即停发轮询。
 
         不再发送 0x02 推流命令 —— 主机不打开设备的连续发送，总线由主机主导，

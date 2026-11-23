@@ -119,7 +119,7 @@ def test_stream(root: tk.Tk, app: App) -> None:
     cli = app.cli
     assert cli is not None
     got = wait_for(root, lambda: cli.push_count > 5, 2.0)
-    check("开始后立刻收到数据帧（50ms 轮询一拍）", got, f"push_count={cli.push_count}")
+    check("开始后立刻收到数据帧（100ms 轮询一拍）", got, f"push_count={cli.push_count}")
 
     # 数值卡片必须显示真实数值，不能是「—」
     wait_for(root, lambda: app.cards[0][0].cget("text") != "—", 2.0)
@@ -129,12 +129,12 @@ def test_stream(root: tk.Tk, app: App) -> None:
           all(_is_num(l.cget("text")) for l, _ in app.cards),
           ", ".join(l.cget("text") for l, _ in app.cards))
 
-    # 轮询模式 20 Hz：帧率统计要给区间，不能按老推流的 500Hz 口径
-    check("运行统计：帧率 ≈ 20Hz（50ms 轮询）",
-          wait_for(root, lambda: 12 <= app.frame_rate <= 30, 3.0),
+    # 轮询模式 10 Hz：帧率统计要给区间，不能按老推流的 500Hz 口径
+    check("运行统计：帧率 ≈ 10Hz（100ms 轮询）",
+          wait_for(root, lambda: 6 <= app.frame_rate <= 15, 3.0),
           f"{app.frame_rate:.0f} Hz")
     check("运行统计：已收帧在增长",
-          wait_for(root, lambda: cli.push_count > 20, 3.0),
+          wait_for(root, lambda: cli.push_count > 20, 5.0),
           str(cli.push_count))
     check("状态横条写着已连接", "已连接" in app.conn_label.cget("text"))
 
@@ -378,7 +378,7 @@ def test_save(root: tk.Tk, app: App, tmpdir: str) -> None:
     cli = app.cli
     assert cli is not None
     n0 = cli.push_count
-    check("保存期间持续收帧", wait_for(root, lambda: cli.push_count > n0 + 40, 4.0),
+    check("保存期间持续收帧", wait_for(root, lambda: cli.push_count > n0 + 25, 5.0),
           f"{cli.push_count - n0} 帧")
     time.sleep(0.5)
     root.update()
@@ -394,7 +394,7 @@ def test_save(root: tk.Tk, app: App, tmpdir: str) -> None:
     heads = re.findall(r"<t[^>]*>([^<]*)</t>", sheet)
     check("表头是六个力通道", heads == list(AXIS_NAMES), str(heads))
     nrows = sheet.count("<row ")
-    check("写入行数合理（表头 + 轮询数据行）", nrows > 35, f"{nrows} 行")
+    check("写入行数合理（表头 + 轮询数据行）", nrows > 25, f"{nrows} 行")
     check("工作表名正确", "六维力数据" in wb)
 
     rows = re.findall(r'<row r="(\d+)">(.*?)</row>', sheet)
@@ -412,7 +412,7 @@ def test_save(root: tk.Tk, app: App, tmpdir: str) -> None:
         book = openpyxl.load_workbook(path)
         ws = book.active
         check("openpyxl 能正常打开导出的文件",
-              ws.max_column == 6 and ws.max_row > 50,
+              ws.max_column == 6 and ws.max_row > 25,
               f"{ws.max_row} 行 × {ws.max_column} 列")
     except ImportError:
         print("[SKIP] 没装 openpyxl，跳过交叉校验")

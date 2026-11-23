@@ -145,7 +145,7 @@ def test_single(cli: Y75Client) -> None:
 
 
 def test_stream(cli: Y75Client) -> None:
-    section("3. 连续采集（先 0x0F 点灯，再每 50ms 一条 0x03 轮询）")
+    section("3. 连续采集（先 0x0F 点灯，再每 100ms 一条 0x03 轮询）")
     cli.stop()
     time.sleep(0.1)
     base = cli.push_count
@@ -163,21 +163,21 @@ def test_stream(cli: Y75Client) -> None:
           str([m for lv, m in logs if lv == "tx"][:3]))
     check("模拟器识别 0x0F（没有出现无应答警告）",
           not any("0x0F 心跳灯无应答" in m for lv, m in logs))
-    check("开始连续：1 秒内就有数据帧（实际 50ms 内）", wait_push(cli, base, 1.0))
+    check("开始连续：1 秒内就有数据帧（实际 100ms 内）", wait_push(cli, base, 1.0))
 
     n0 = cli.push_count
     t0 = time.time()
     time.sleep(1.0)
     dt = time.time() - t0
     rate = (cli.push_count - n0) / dt
-    check("轮询速率 ≈ 20 Hz", 14 <= rate <= 26, f"实测 {rate:.1f} Hz")
+    check("轮询速率 ≈ 10 Hz", 7 <= rate <= 13, f"实测 {rate:.1f} Hz")
 
     # 已在轮询时再点一次「开始」：不得叠加第二个轮询线程
     cli.start()
     n1 = cli.push_count
     time.sleep(1.0)
     rate2 = (cli.push_count - n1) / dt
-    check("重复点开始不叠加轮询（速率不翻倍）", 14 <= rate2 <= 26,
+    check("重复点开始不叠加轮询（速率不翻倍）", 7 <= rate2 <= 13,
           f"实测 {rate2:.1f} Hz")
 
     # 数值必须随时间变化，否则波形是直线
@@ -196,12 +196,13 @@ def test_stream(cli: Y75Client) -> None:
     check("take_wave 无新数据时返回空（界面不必重绘）", snap2 == [])
 
     # 点数横轴按「个数」取：切到点数模式后，界面要的是一条定长尾巴
-    time.sleep(0.05)
+    # 轮询 100ms 一拍，取快照前至少等一拍，否则 take_wave 会因「无新帧」返回空
+    time.sleep(0.15)
     _, snap3 = cli.take_wave(max_points=50)
     check("take_wave(max_points) 按个数取，且取的是最新的一段",
           len(snap3) == min(50, len(cli.wave)) and snap3[-1] == cli.wave[-1],
           f"{len(snap3)} 点，与缓冲尾部一致={bool(snap3) and snap3[-1] == cli.wave[-1]}")
-    time.sleep(0.05)
+    time.sleep(0.15)
     _, snap4 = cli.take_wave(999.0, max_points=30)
     check("同时给 window_sec 和 max_points 时以点数为准",
           len(snap4) == min(30, len(cli.wave)), f"{len(snap4)} 点")
@@ -245,7 +246,7 @@ def test_stream_clock(cli: Y75Client) -> None:
     base = cli.push_count
     cli.start()
     wait_push(cli, base, 1.0)
-    time.sleep(1.4)                       # 20Hz 轮询：1.4s ≈ 28 帧
+    time.sleep(3.0)                       # 10Hz 轮询：3s ≈ 30 帧，够取 25 点
 
     lag = time.time() - cli.wave[-1][0]
     check("最新样本时间戳与本机时间对齐（没冲进未来）",
@@ -256,7 +257,7 @@ def test_stream_clock(cli: Y75Client) -> None:
 
     # 只看「最后一次开始」之后的那一段：跨过断流点的样本中间是真空白
     # （那 0.9s 设备确实没发帧），跨度自然对不上，不是 bug。
-    # 轮询 20Hz，取 25 点（≈1.2s）；等间距按 50ms 铺格子。
+    # 轮询 10Hz，取 25 点（≈2.4s）；等间距按 100ms 铺格子。
     _, samples = cli.take_wave(max_points=25)
     ivs = sorted(b[0] - a[0] for a, b in zip(samples, samples[1:]))
     med = ivs[len(ivs) // 2] if ivs else 0.0
@@ -553,7 +554,8 @@ def test_short_frames(host: str, port: int) -> None:
             base = cli.push_count
             time.sleep(1.0)
             got = cli.push_count - base
-            check("畸形帧混流下轮询仍能正常接收", got >= 12, f"1 秒内收到 {got} 帧")
+            check("畸形帧混流下轮询仍能正常接收", got >= 7,
+                  f"1 秒内收到 {got} 帧（约 10Hz）")
             check("畸形帧被识别并计数", cli.short_frames >= 10, f"short={cli.short_frames}")
             check("畸形帧不触发拆帧重同步", cli.frame_errors == 0,
                   f"resync={cli.frame_errors}")
