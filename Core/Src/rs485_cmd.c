@@ -254,6 +254,7 @@ void rs485_cmd_dispatch(uint8_t cmd, const uint8_t *payload, uint16_t len)
     /* ---- 0x01  Stop continuous send (also turns the heartbeat LED off) ---- */
     case RS485_CMD_STOP:
         g_sys.send_mode = 0;
+        HAL_TIM_Base_Stop_IT(&htim2);
         g_sys.led_blink = 0;
         ack(cmd);
         break;

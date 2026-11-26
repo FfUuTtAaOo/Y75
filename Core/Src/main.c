@@ -68,7 +68,7 @@ volatile sensor_data_t   g_sensor;
 volatile system_state_t  g_sys;
 config_t                 g_config = {
     .sn         = "HS-01234567",
-    .fw_version = 0x00010706,
+    .fw_version = 0x00010707,
 };
 decouple_matrix_t        g_matrix;
 
@@ -179,29 +179,7 @@ void USART1_IRQHandler(void)
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM2) {
-        uint32_t sp = __get_MSP();
-
-        if (sp < g_min_msp) {
-            g_min_msp = sp;               /* 记录栈用过的最深位置 */
-        }
         g_tick_ms++;
-
-        if (g_tick_ms % 3 == 0) {
-            uint32_t raw[ADC_CHANNEL_NUM];
-            uint8_t  i;
-            /* 单颗 LHA7668 六通道 = FX/FY/FZ/TX/TY/TZ。
-               整组读取，任一通道超时/序列异常则整组不更新，
-               数组各通道保留自己上一次的有效值，绝不相互错位 */
-            if (int_adcData_6ch(raw) == 0) {
-                for (i = 0; i < ADC_CHANNEL_NUM; i++) {
-                    adc_data_buff[adc_data_int_count][i] = raw[i];
-                }
-            }
-            adc_data_int_count++;
-            if (adc_data_int_count >= 64) {
-                adc_data_int_count = 0;
-            }
-        }
     }
 }
 
@@ -221,8 +199,7 @@ uint8_t mb_buf_send[33] = { 0 };
 
 static void rs485_send_continuous(void)
 {
-    uint32_t interval = (g_sys.freq_mode == 0) ? 2U : 1U;  /* 500Hz or 1kHz */
-    if ((g_tick_ms - g_last_rs485_send_ms) >= interval) {
+    if (g_tick_ms >= g_last_rs485_send_ms) {
         g_last_rs485_send_ms = g_tick_ms;
 
         /* Only reached while g_sys.send_mode == 1 (checked by the caller).
@@ -343,25 +320,37 @@ int main(void)
   /* USER CODE BEGIN WHILE */
     while (1) {
         {
+            uint32_t raw[ADC_CHANNEL_NUM];
+            uint8_t  i;
             float adc_tmp[ADC_CHANNEL_NUM] = { 0 };
-
-            if (adc_data_usr_count != adc_data_int_count) {
+            /* 单颗 LHA7668 六通道 = FX/FY/FZ/TX/TY/TZ。
+            整组读取，任一通道超时/序列异常则整组不更新，
+            数组各通道保留自己上一次的有效值，绝不相互错位 */
+            if (int_adcData_6ch(raw) == 0) {
+                for (i = 0; i < ADC_CHANNEL_NUM; i++) {
+                    adc_data_buff[adc_data_int_count][i] = raw[i];
+                }
                 adc_data_usr_count = adc_data_int_count;
-                for (uint8_t i = 0; i < ADC_CHANNEL_NUM; i++) {
-                    adc_tmp[i] = adc_data_calculate(i);
-                    adc_tmp[i] *= 5 / 3.3;
-
-                    if (g_sys.zero_calib_busy == 0) {
-                        adc_tmp[i] -= g_sensor.force_zero[i];
-                    }
-                }
-
-                if (g_sys.zero_calib_busy == 1) {
-                    calib_zero_cale(adc_tmp);
-                }
-
-                adc_data_proc(adc_tmp);
             }
+            adc_data_int_count++;
+            if (adc_data_int_count >= 64) {
+                adc_data_int_count = 0;
+            }
+
+            for (uint8_t i = 0; i < ADC_CHANNEL_NUM; i++) {
+                adc_tmp[i] = adc_data_calculate(i);
+                adc_tmp[i] *= 5 / 3.3;
+
+                if (g_sys.zero_calib_busy == 0) {
+                    adc_tmp[i] -= g_sensor.force_zero[i];
+                }
+            }
+
+            if (g_sys.zero_calib_busy == 1) {
+                calib_zero_cale(adc_tmp);
+            }
+
+            adc_data_proc(adc_tmp);
         }
 
         if (calib_zero_is_done()) {
